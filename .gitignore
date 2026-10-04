@@ -4,8 +4,14 @@ __pycache__/
 *$py.class
 
 # Test outputs and received files
+downloads/
 received_*
 *.tmp
+
+# SQLite & Logs
+*.db
+*.sqlite3
+chat_log.txt
 
 # Virtual environments
 venv/

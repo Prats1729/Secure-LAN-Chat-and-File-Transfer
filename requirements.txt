@@ -1,2 +1,2 @@
-# No third-party packages required.
-# All modules used (socket, threading, hashlib, os, sys) are part of the Python Standard Library.
+# Secure LAN Chat & File Transfer - Dependencies
+cryptography>=41.0.0

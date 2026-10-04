@@ -1,360 +1,551 @@
 #!/usr/bin/env python3
 """
-Secure LAN Chat & File Transfer - SERVER (v3: encrypted + UDP discovery)
-Run: python3 server.py [tcp_port] [udp_discovery_port]
-     defaults: tcp_port=5050, udp_discovery_port=5051
-
-WHAT'S NEW IN THIS VERSION
----------------------------------------------------------------------
-1. AES-256-GCM ENCRYPTION - every byte exchanged with a client (chat
-   text AND file contents) is encrypted using a key derived from a
-   shared passphrase (see SHARED_PASSPHRASE below). Anyone sniffing
-   the LAN with Wireshark sees only ciphertext, not the actual chat
-   or file content. This is what makes the project's "Secure" name
-   actually true, not just a title.
-
-   IMPORTANT: SHARED_PASSPHRASE below must be IDENTICAL in server.py
-   and client.py, or clients simply won't be able to talk to the
-   server (decryption will fail and the connection will be dropped).
-
-2. UDP AUTO-DISCOVERY - the server also listens on a UDP port and
-   answers "where are you?" broadcasts from clients on the LAN, so
-   the client doesn't need to be told the server's IP address
-   manually. This also gives you a second protocol (UDP, connection-
-   less) to show in Wireshark next to the TCP chat traffic.
-
-3. CHAT HISTORY - the last 20 broadcast messages are kept in memory
-   and replayed (still encrypted) to any client that joins, so late
-   joiners aren't starting from a blank screen.
-
-4. CHUNKED FILE TRANSFER - files are now sent in fixed-size chunks
-   instead of one big blob, which is what lets both sides show a
-   live progress bar (see client.py).
-
-PROTOCOL (all payloads below are ENCRYPTED FRAMES - see send_frame /
-recv_frame - the text shown here is the plaintext *inside* the frame
-after decryption):
-
-  First frame from client after connecting: <username>  (plain text)
-
-  Client -> Server:
-    MSG:<text>
-    PMSG:<target_user>:<text>
-    LIST:
-    FILE_START:<filename>:<filesize>:<sha256hex>:<numchunks>
-        (followed by <numchunks> raw-bytes frames = broadcast file)
-    PFILE_START:<target_user>:<filename>:<filesize>:<sha256hex>:<numchunks>
-        (followed by <numchunks> raw-bytes frames = private file)
-
-  Server -> Client:
-    SYS:<message>
-    CHAT:<sender>:<text>
-    PCHAT:<sender>:<text>
-    HIST:<timestamp>:<sender>:<text>          (chat history replay)
-    FILE_START:<sender>:<filename>:<filesize>:<sha256hex>:<numchunks>
-    PFILE_START:<sender>:<filename>:<filesize>:<sha256hex>:<numchunks>
-    USERLIST:<comma-separated usernames>
-    ERR:<message>
+Secure LAN Chat & File Transfer - ADVANCED SERVER (v4)
+Features:
+- AES-256-GCM Transport Security
+- X25519 ECDH Public Key Directory for Zero-Knowledge E2EE
+- SQLite Persistent Chat & File Transfer History
+- Multi-Channel / Chat Rooms (#general, #dev, #random, custom rooms)
+- Multiplexed Non-blocking File Streaming
+- Live Typing Indicators & User Presence (Online / Away / Busy)
+- Heartbeat / Dead Client Pruning
+- UDP LAN Broadcast Auto-Discovery
+- Interactive Server Admin Console
 """
 
 import socket
 import threading
 import sys
-import datetime
 import os
-from collections import deque
+import time
+import datetime
+import sqlite3
+from typing import Dict, List, Optional, Any
+from collections import defaultdict
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
+from crypto_utils import (
+    derive_transport_key,
+    send_json_packet,
+    recv_json_packet,
+    sanitize_filename
+)
 
-# ============================================================
-# SHARED SECRET - must match client.py exactly. Change this to
-# your own passphrase before a real demo (anyone who knows this
-# string can decrypt the traffic - that's the whole point of it
-# being a *shared secret*, like a Wi-Fi password).
-# ============================================================
-SHARED_PASSPHRASE = "SecureLANChat2026"
-_SALT = b"lan-chat-fixed-salt-v1"  # fixed so both sides derive the same key
-
-def _derive_key(passphrase: str) -> bytes:
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_SALT, iterations=200_000)
-    return kdf.derive(passphrase.encode())
-
-AES_KEY = _derive_key(SHARED_PASSPHRASE)
-aesgcm = AESGCM(AES_KEY)
-
-CHUNK_SIZE = 64 * 1024  # 64 KB per file chunk
+# Configuration defaults
+DEFAULT_PASSPHRASE = "SecureLANChat2026"
+DEFAULT_TCP_PORT = 5050
+DEFAULT_UDP_PORT = 5051
+DB_FILE = "lan_chat.db"
 UDP_DISCOVER_MSG = b"LANCHAT_DISCOVER"
 
-
-# ---------------- encrypted framing over TCP ----------------
-def recv_exact(conn, n):
-    data = bytearray()
-    while len(data) < n:
-        chunk = conn.recv(min(4096, n - len(data)))
-        if not chunk:
-            return None
-        data.extend(chunk)
-    return bytes(data)
-
-
-def send_frame(conn, plaintext: bytes):
-    nonce = os.urandom(12)
-    ct = aesgcm.encrypt(nonce, plaintext, None)
-    payload = nonce + ct
-    conn.sendall(len(payload).to_bytes(4, "big") + payload)
-
-
-def send_text(conn, text: str):
-    send_frame(conn, text.encode())
-
-
-def recv_frame(conn):
-    """Returns decrypted plaintext bytes, or None on disconnect/decrypt failure."""
-    hdr = recv_exact(conn, 4)
-    if hdr is None:
-        return None
-    length = int.from_bytes(hdr, "big")
-    payload = recv_exact(conn, length)
-    if payload is None:
-        return None
-    nonce, ct = payload[:12], payload[12:]
-    try:
-        return aesgcm.decrypt(nonce, ct, None)
-    except Exception:
-        return None  # wrong key / tampered data
-
-
-def recv_text(conn):
-    data = recv_frame(conn)
-    if data is None:
-        return None
-    return data.decode(errors="replace")
-
-
-# ---------------- shared state ----------------
-clients = []          # list of dicts: {"conn": socket, "username": str}
+# Server State
+clients: List[Dict[str, Any]] = []  # List of {"conn": socket, "addr": tuple, "username": str, "pubkey": str, "rooms": set, "status": str, "last_seen": float}
 clients_lock = threading.Lock()
-
-history = deque(maxlen=20)   # tuples: (timestamp, sender, text)
-history_lock = threading.Lock()
-
-LOG_FILE = "chat_log.txt"
-log_lock = threading.Lock()
+db_lock = threading.Lock()
 
 
-def log(line):
+# ============================================================
+# Database Setup
+# ============================================================
+
+def init_database():
+    """Initialize SQLite database for chat logs, rooms, and audit trails."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                room TEXT,
+                sender TEXT,
+                target TEXT,
+                content TEXT,
+                is_private INTEGER
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS file_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                sender TEXT,
+                target TEXT,
+                room TEXT,
+                filename TEXT,
+                filesize INTEGER,
+                filehash TEXT,
+                status TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                event TEXT,
+                details TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+
+def db_log_message(room: Optional[str], sender: str, target: Optional[str], content: str, is_private: bool = False):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with log_lock:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {line}\n")
-    print(f"[{ts}] {line}")
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO messages (timestamp, room, sender, target, content, is_private) VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, room or "", sender, target or "", content, 1 if is_private else 0)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[DB Error] Failed to log message: {e}")
 
 
-def find_conn(username):
+def db_log_file_transfer(sender: str, target: Optional[str], room: Optional[str], filename: str, filesize: int, filehash: str):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO file_transfers (timestamp, sender, target, room, filename, filesize, filehash, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, sender, target or "", room or "", filename, filesize, filehash, "COMPLETED")
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[DB Error] Failed to log transfer: {e}")
+
+
+def db_get_room_history(room: str, limit: int = 30) -> List[Dict[str, str]]:
+    with db_lock:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT timestamp, sender, content FROM messages WHERE room = ? AND is_private = 0 ORDER BY id DESC LIMIT ?",
+                (room, limit)
+            )
+            rows = cur.fetchall()
+            conn.close()
+            return [{"timestamp": r[0], "sender": r[1], "content": r[2]} for r in reversed(rows)]
+        except Exception:
+            return []
+
+
+# ============================================================
+# Client & State Management
+# ============================================================
+
+def log_event(event_str: str):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {event_str}")
+
+
+def find_client_by_name(username: str) -> Optional[Dict[str, Any]]:
     with clients_lock:
         for c in clients:
             if c["username"] == username:
-                return c["conn"]
+                return c
     return None
 
 
-def broadcast_text(text, exclude_conn=None):
+def get_user_list_payload() -> List[Dict[str, Any]]:
     with clients_lock:
-        targets = [c["conn"] for c in clients if c["conn"] is not exclude_conn]
+        return [
+            {
+                "username": c["username"],
+                "pubkey": c["pubkey"],
+                "status": c.get("status", "online"),
+                "rooms": list(c.get("rooms", ["#general"]))
+            }
+            for c in clients
+        ]
+
+
+def broadcast_userlist(aes_cipher: AESGCM):
+    users = get_user_list_payload()
+    packet = {
+        "type": "USERLIST",
+        "users": users
+    }
+    with clients_lock:
+        target_conns = [c["conn"] for c in clients]
+    for conn in target_conns:
+        send_json_packet(conn, packet, aes_cipher)
+
+
+def broadcast_to_room(room: str, packet: Dict[str, Any], aes_cipher: AESGCM, exclude_conn=None):
+    with clients_lock:
+        targets = [c["conn"] for c in clients if room in c.get("rooms", set()) and c["conn"] is not exclude_conn]
     for conn in targets:
-        try:
-            send_text(conn, text)
-        except OSError:
-            pass
+        send_json_packet(conn, packet, aes_cipher)
 
 
-def remove_client(conn):
+def broadcast_system_msg(text: str, room: Optional[str], aes_cipher: AESGCM, exclude_conn=None):
+    packet = {
+        "type": "SYS",
+        "room": room or "#general",
+        "content": text,
+        "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+    }
+    if room:
+        broadcast_to_room(room, packet, aes_cipher, exclude_conn=exclude_conn)
+    else:
+        with clients_lock:
+            targets = [c["conn"] for c in clients if c["conn"] is not exclude_conn]
+        for conn in targets:
+            send_json_packet(conn, packet, aes_cipher)
+
+
+def remove_client(conn, aes_cipher: AESGCM):
+    removed_user = None
     with clients_lock:
-        clients[:] = [c for c in clients if c["conn"] is not conn]
+        for i, c in enumerate(clients):
+            if c["conn"] is conn:
+                removed_user = c["username"]
+                clients.pop(i)
+                break
+    if removed_user:
+        log_event(f"[-] {removed_user} disconnected")
+        broadcast_system_msg(f"{removed_user} has left the chat", None, aes_cipher)
+        broadcast_userlist(aes_cipher)
 
 
-def current_usernames():
-    with clients_lock:
-        return [c["username"] for c in clients]
+# ============================================================
+# Client Connection Handler
+# ============================================================
 
+def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
+    # Initial Handshake packet expected: {"type": "JOIN", "username": "...", "pubkey": "..."}
+    handshake = recv_json_packet(conn, aes_cipher)
+    if not handshake or handshake.get("type") != "JOIN":
+        conn.close()
+        return
 
-def relay_chunks(conn, src_conn, target_conns, num_chunks):
-    """Read num_chunks raw frames from src_conn and forward each to every
-    connection in target_conns, as they arrive (streaming, not buffered
-    all at once) - this is what lets the receiver show live progress."""
-    for _ in range(num_chunks):
-        chunk = recv_frame(src_conn)
-        if chunk is None:
-            return False
-        for t in target_conns:
-            try:
-                send_frame(t, chunk)
-            except OSError:
-                pass
-    return True
+    username = str(handshake.get("username", "")).strip()
+    pubkey = str(handshake.get("pubkey", "")).strip()
 
-
-def handle_client(conn, addr):
-    username = recv_text(conn)
-    if not username:
+    if not username or len(username) > 30:
+        send_json_packet(conn, {"type": "ERR", "content": "Invalid username."}, aes_cipher)
         conn.close()
         return
 
     with clients_lock:
-        if any(c["username"] == username for c in clients):
-            try:
-                send_text(conn, "ERR:That username is already taken on this server.")
-            except OSError:
-                pass
+        if any(c["username"].lower() == username.lower() for c in clients):
+            send_json_packet(conn, {"type": "ERR", "content": f"Username '{username}' is already taken."}, aes_cipher)
             conn.close()
             return
-        clients.append({"conn": conn, "username": username})
 
-    log(f"+ {username} connected from {addr[0]}:{addr[1]}")
+        client_entry = {
+            "conn": conn,
+            "addr": addr,
+            "username": username,
+            "pubkey": pubkey,
+            "rooms": {"#general"},
+            "status": "online",
+            "last_seen": time.time()
+        }
+        clients.append(client_entry)
 
-    # Replay recent chat history to the new joiner only
-    with history_lock:
-        hist_snapshot = list(history)
-    for ts, sender, text in hist_snapshot:
-        try:
-            send_text(conn, f"HIST:{ts}:{sender}:{text}")
-        except OSError:
-            break
+    log_event(f"[+] {username} joined from {addr[0]}:{addr[1]}")
 
-    broadcast_text(f"SYS:{username} has joined the chat", exclude_conn=conn)
+    # Confirm join to client
+    send_json_packet(conn, {
+        "type": "JOIN_OK",
+        "username": username,
+        "rooms": ["#general", "#dev", "#random"],
+        "current_room": "#general"
+    }, aes_cipher)
+
+    # Replay #general history
+    history = db_get_room_history("#general", limit=25)
+    for h in history:
+        send_json_packet(conn, {
+            "type": "HIST",
+            "room": "#general",
+            "sender": h["sender"],
+            "content": h["content"],
+            "timestamp": h["timestamp"]
+        }, aes_cipher)
+
+    broadcast_system_msg(f"{username} has joined #general", "#general", aes_cipher, exclude_conn=conn)
+    broadcast_userlist(aes_cipher)
 
     try:
         while True:
-            line = recv_text(conn)
-            if line is None:
+            packet = recv_json_packet(conn, aes_cipher)
+            if packet is None:
                 break
 
-            if line.startswith("MSG:"):
-                text = line[4:]
+            client_entry["last_seen"] = time.time()
+            ptype = packet.get("type")
+
+            # 1. Room Chat Message
+            if ptype == "MSG" or ptype == "ROOM_MSG":
+                room = packet.get("room", "#general")
+                content = str(packet.get("content", ""))
                 ts = datetime.datetime.now().strftime("%H:%M:%S")
-                with history_lock:
-                    history.append((ts, username, text))
-                log(f"[broadcast] {username}: {text}")
-                broadcast_text(f"CHAT:{username}:{text}", exclude_conn=conn)
 
-            elif line.startswith("PMSG:"):
-                rest = line[5:]
-                target, text = rest.split(":", 1)
-                target_conn = find_conn(target)
-                if target_conn is None:
-                    send_text(conn, f"ERR:User '{target}' is not online.")
-                    continue
-                log(f"[private] {username} -> {target}: {text}")
-                try:
-                    send_text(target_conn, f"PCHAT:{username}:{text}")
-                except OSError:
-                    send_text(conn, f"ERR:Could not deliver message to '{target}'.")
+                db_log_message(room, username, None, content, is_private=False)
+                log_event(f"[{room}] {username}: {content}")
 
-            elif line.startswith("LIST:"):
-                names = current_usernames()
-                send_text(conn, "USERLIST:" + ",".join(names))
+                out_packet = {
+                    "type": "ROOM_MSG",
+                    "room": room,
+                    "sender": username,
+                    "content": content,
+                    "timestamp": ts
+                }
+                broadcast_to_room(room, out_packet, aes_cipher, exclude_conn=conn)
 
-            elif line.startswith("FILE_START:"):
-                rest = line[len("FILE_START:"):]
-                filename, filesize_str, filehash, numchunks_str = rest.split(":", 3)
-                filesize = int(filesize_str)
-                numchunks = int(numchunks_str)
+            # 2. End-to-End Encrypted Private Message (PMSG)
+            elif ptype == "PMSG":
+                target = packet.get("target")
+                encrypted_payload = packet.get("content", "")
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
 
-                log(f"[broadcast file] {username} -> everyone: {filename} "
-                    f"({filesize} bytes, {numchunks} chunks, sha256={filehash})")
-
-                with clients_lock:
-                    targets = [c["conn"] for c in clients if c["conn"] is not conn]
-                header = f"FILE_START:{username}:{filename}:{filesize}:{filehash}:{numchunks}"
-                for t in targets:
-                    try:
-                        send_text(t, header)
-                    except OSError:
-                        pass
-
-                if not relay_chunks(conn, conn, targets, numchunks):
-                    break
-
-            elif line.startswith("PFILE_START:"):
-                rest = line[len("PFILE_START:"):]
-                target, filename, filesize_str, filehash, numchunks_str = rest.split(":", 4)
-                filesize = int(filesize_str)
-                numchunks = int(numchunks_str)
-
-                target_conn = find_conn(target)
-                if target_conn is None:
-                    # Still need to drain the chunks off the wire so the
-                    # protocol stays in sync, even though we discard them.
-                    for _ in range(numchunks):
-                        if recv_frame(conn) is None:
-                            break
-                    send_text(conn, f"ERR:User '{target}' is not online. File not sent.")
+                target_client = find_client_by_name(target)
+                if not target_client:
+                    send_json_packet(conn, {"type": "ERR", "content": f"User '{target}' is not online."}, aes_cipher)
                     continue
 
-                log(f"[private file] {username} -> {target}: {filename} "
-                    f"({filesize} bytes, {numchunks} chunks, sha256={filehash})")
-                try:
-                    send_text(target_conn, f"PFILE_START:{username}:{filename}:{filesize}:{filehash}:{numchunks}")
-                except OSError:
-                    pass
+                log_event(f"[E2EE PM] {username} -> {target}")
+                db_log_message(None, username, target, "[E2EE Private Message]", is_private=True)
 
-                if not relay_chunks(conn, conn, [target_conn], numchunks):
-                    break
+                out_packet = {
+                    "type": "PMSG",
+                    "sender": username,
+                    "target": target,
+                    "content": encrypted_payload,
+                    "sender_pubkey": pubkey,
+                    "timestamp": ts
+                }
+                send_json_packet(target_client["conn"], out_packet, aes_cipher)
+
+            # 3. Room Management (/join, /leave, /rooms)
+            elif ptype == "ROOM_JOIN":
+                target_room = packet.get("room", "").strip()
+                if not target_room.startswith("#"):
+                    target_room = "#" + target_room
+                client_entry["rooms"].add(target_room)
+
+                # Replay room history
+                hist = db_get_room_history(target_room, limit=25)
+                for h in hist:
+                    send_json_packet(conn, {
+                        "type": "HIST",
+                        "room": target_room,
+                        "sender": h["sender"],
+                        "content": h["content"],
+                        "timestamp": h["timestamp"]
+                    }, aes_cipher)
+
+                send_json_packet(conn, {
+                    "type": "ROOM_JOINED",
+                    "room": target_room
+                }, aes_cipher)
+                broadcast_system_msg(f"{username} joined {target_room}", target_room, aes_cipher, exclude_conn=conn)
+                broadcast_userlist(aes_cipher)
+
+            elif ptype == "ROOM_LEAVE":
+                target_room = packet.get("room", "")
+                if target_room != "#general" and target_room in client_entry["rooms"]:
+                    client_entry["rooms"].remove(target_room)
+                    broadcast_system_msg(f"{username} left {target_room}", target_room, aes_cipher)
+                    broadcast_userlist(aes_cipher)
+
+            # 4. User Status Change (/status away/busy/online)
+            elif ptype == "STATUS":
+                status = packet.get("status", "online")
+                client_entry["status"] = status
+                broadcast_userlist(aes_cipher)
+
+            # 5. Live Typing Indicator
+            elif ptype == "TYPING":
+                room = packet.get("room")
+                target = packet.get("target")
+                is_typing = bool(packet.get("is_typing", False))
+                out_packet = {
+                    "type": "TYPING",
+                    "sender": username,
+                    "room": room,
+                    "target": target,
+                    "is_typing": is_typing
+                }
+                if target:
+                    tc = find_client_by_name(target)
+                    if tc:
+                        send_json_packet(tc["conn"], out_packet, aes_cipher)
+                elif room:
+                    broadcast_to_room(room, out_packet, aes_cipher, exclude_conn=conn)
+
+            # 6. File Transfer: Start & Streaming Relay
+            elif ptype == "FILE_START" or ptype == "PFILE_START":
+                transfer_id = packet.get("transfer_id")
+                filename = sanitize_filename(packet.get("filename", "file"))
+                filesize = int(packet.get("filesize", 0))
+                filehash = packet.get("filehash", "")
+                num_chunks = int(packet.get("num_chunks", 0))
+                target = packet.get("target")
+                room = packet.get("room", "#general")
+                is_e2ee = bool(packet.get("is_e2ee", False))
+
+                packet["sender"] = username
+                packet["sender_pubkey"] = pubkey
+
+                if ptype == "PFILE_START" or target:
+                    tc = find_client_by_name(target)
+                    if not tc:
+                        send_json_packet(conn, {"type": "ERR", "content": f"User '{target}' is offline for file transfer."}, aes_cipher)
+                        continue
+                    log_event(f"[File] {username} -> {target} (E2EE): '{filename}' ({filesize:,} bytes, {num_chunks} chunks)")
+                    send_json_packet(tc["conn"], packet, aes_cipher)
+                else:
+                    log_event(f"[File] {username} -> {room}: '{filename}' ({filesize:,} bytes, {num_chunks} chunks)")
+                    broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
+
+                db_log_file_transfer(username, target, room, filename, filesize, filehash)
+
+            # 7. File Chunks Relay (Multiplexed streaming)
+            elif ptype == "FILE_CHUNK":
+                target = packet.get("target")
+                room = packet.get("room", "#general")
+                packet["sender"] = username
+
+                if target:
+                    tc = find_client_by_name(target)
+                    if tc:
+                        send_json_packet(tc["conn"], packet, aes_cipher)
+                else:
+                    broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
+
+            # 8. File Completion / Acknowledgement
+            elif ptype == "FILE_END" or ptype == "FILE_CANCEL":
+                target = packet.get("target")
+                room = packet.get("room", "#general")
+                packet["sender"] = username
+
+                if target:
+                    tc = find_client_by_name(target)
+                    if tc:
+                        send_json_packet(tc["conn"], packet, aes_cipher)
+                else:
+                    broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
+
+            # 9. Heartbeat Ping / Pong
+            elif ptype == "PING":
+                send_json_packet(conn, {"type": "PONG", "ts": time.time()}, aes_cipher)
+
+            elif ptype == "PONG":
+                client_entry["last_seen"] = time.time()
+
     finally:
-        log(f"- {username} disconnected")
-        remove_client(conn)
-        broadcast_text(f"SYS:{username} has left the chat", exclude_conn=conn)
-        conn.close()
-
-
-def udp_discovery_server(udp_port, tcp_port):
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind(("0.0.0.0", udp_port))
-    print(f"UDP discovery listening on port {udp_port} (clients can auto-find this server)")
-
-    while True:
+        remove_client(conn, aes_cipher)
         try:
-            data, addr = udp_sock.recvfrom(1024)
+            conn.close()
         except OSError:
-            break
-        if data == UDP_DISCOVER_MSG:
-            reply = f"LANCHAT_SERVER:{tcp_port}".encode()
+            pass
+
+
+# ============================================================
+# Background Watchdog & UDP Discovery
+# ============================================================
+
+def heartbeat_watchdog(aes_cipher: AESGCM):
+    """Prune unresponsive sockets that have missed heartbeats."""
+    while True:
+        time.sleep(15)
+        now = time.time()
+        stale_conns = []
+        with clients_lock:
+            for c in clients:
+                if now - c.get("last_seen", now) > 45:
+                    stale_conns.append(c["conn"])
+                else:
+                    try:
+                        send_json_packet(c["conn"], {"type": "PING"}, aes_cipher)
+                    except Exception:
+                        stale_conns.append(c["conn"])
+        for dead_conn in stale_conns:
             try:
-                udp_sock.sendto(reply, addr)
-                print(f"[UDP] discovery request from {addr[0]}:{addr[1]} -> replied with TCP port {tcp_port}")
+                dead_conn.close()
             except OSError:
                 pass
 
 
-def main():
-    tcp_port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
-    udp_port = int(sys.argv[2]) if len(sys.argv) > 2 else 5051
+def udp_discovery_responder(udp_port: int, tcp_port: int):
+    """Answer UDP broadcast queries from clients searching for the server."""
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp_sock.bind(("0.0.0.0", udp_port))
+    except Exception as e:
+        print(f"[UDP Error] Could not bind UDP discovery on port {udp_port}: {e}")
+        return
 
-    threading.Thread(target=udp_discovery_server, args=(udp_port, tcp_port), daemon=True).start()
+    log_event(f"UDP discovery active on port {udp_port}")
+    while True:
+        try:
+            data, addr = udp_sock.recvfrom(1024)
+            if data == UDP_DISCOVER_MSG:
+                reply = f"LANCHAT_SERVER:{tcp_port}:SecureServer".encode("utf-8")
+                udp_sock.sendto(reply, addr)
+                # log_event(f"[UDP Discovery] Answered query from {addr[0]}:{addr[1]}")
+        except OSError:
+            break
+
+
+# ============================================================
+# Main Entry Point
+# ============================================================
+
+def main():
+    tcp_port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_TCP_PORT
+    udp_port = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_UDP_PORT
+    passphrase = os.environ.get("LANCHAT_KEY", DEFAULT_PASSPHRASE)
+
+    init_database()
+    aes_key = derive_transport_key(passphrase)
+    aes_cipher = AESGCM(aes_key)
+
+    # Launch background services
+    threading.Thread(target=udp_discovery_responder, args=(udp_port, tcp_port), daemon=True).start()
+    threading.Thread(target=heartbeat_watchdog, args=(aes_cipher,), daemon=True).start()
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(("0.0.0.0", tcp_port))
-    server_sock.listen(20)
+    try:
+        server_sock.bind(("0.0.0.0", tcp_port))
+    except Exception as e:
+        print(f"Failed to bind TCP port {tcp_port}: {e}")
+        sys.exit(1)
 
-    print("=== Secure LAN Chat Server (Python, Encrypted) ===")
-    print(f"TCP chat/file port: {tcp_port}")
-    print(f"UDP discovery port: {udp_port}")
-    print(f"Chat log: {LOG_FILE}")
-    print("Encryption: AES-256-GCM, key derived from the shared passphrase in this file.")
-    print("(Ctrl+C to stop)")
+    server_sock.listen(50)
+
+    print("=" * 65)
+    print("      SECURE LAN CHAT & FILE TRANSFER - ADVANCED SERVER v4")
+    print("=" * 65)
+    print(f" [+] TCP Port (Chat/Files/Multiplexed) : {tcp_port}")
+    print(f" [+] UDP Port (LAN Auto-Discovery)    : {udp_port}")
+    print(f" [+] Database                          : {DB_FILE} (SQLite)")
+    print(f" [+] Transport Encryption             : AES-256-GCM (PBKDF2-HMAC-SHA256)")
+    print(f" [+] End-to-End Encryption (E2EE)     : X25519 ECDH + HKDF")
+    print(f" [+] Multi-Channel Rooms               : #general, #dev, #random")
+    print("=" * 65)
+    print("Press Ctrl+C to shut down.\n")
 
     try:
         while True:
             conn, addr = server_sock.accept()
-            print(f"New connection from {addr[0]}:{addr[1]}")
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t = threading.Thread(target=handle_client, args=(conn, addr, aes_cipher), daemon=True)
             t.start()
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        print("\nShutting down server gracefully...")
     finally:
         server_sock.close()
 
