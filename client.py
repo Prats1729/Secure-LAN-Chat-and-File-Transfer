@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Secure LAN Chat & File Transfer - ADVANCED CLI CLIENT (v4)
+Secure LAN Chat & File Transfer - ADVANCED CLI CLIENT (v4.5)
 Features:
 - AES-256-GCM Transport Encryption
 - True End-to-End Encryption (E2EE) with X25519 ECDH + HKDF for Private Messages & Files
+- Voice Notes Recording & Playback (/voice <sec>, /voiceto <user> <sec>, /play <file>)
 - Multi-Channel Chat Rooms (#general, #dev, #random, /join #custom)
 - Streaming Disk-to-Disk File Transfer with live MB/s, ETA, and progress bar
 - Non-blocking Asynchronous Terminal UI with un-clobbered prompt
@@ -35,6 +36,9 @@ from crypto_utils import (
     sanitize_filename,
     get_unique_filepath,
     compute_file_sha256,
+    start_voice_recording,
+    stop_voice_recording,
+    play_audio_file,
     CHUNK_SIZE
 )
 
@@ -69,10 +73,23 @@ e2ee_keys_cache: Dict[str, bytes] = {}  # username -> shared_key_bytes
 
 # Active incoming file transfers: transfer_id -> {file_obj, filename, filesize, received_bytes, hasher, start_time, sender, is_e2ee, shared_key}
 active_downloads: Dict[str, Dict[str, Any]] = {}
-active_downloads_lock = threading.Lock()
+active_downloads_lock = threading.RLock()
 
+sock_send_lock = threading.RLock()
 input_buffer = ""
-prompt_lock = threading.Lock()
+prompt_lock = threading.RLock()
+
+
+def safe_send_packet(packet_dict: Dict[str, Any]) -> bool:
+    """Thread-safe frame sender for CLI client."""
+    global sock, aes_cipher
+    if not sock or not aes_cipher:
+        return False
+    try:
+        with sock_send_lock:
+            return send_json_packet(sock, packet_dict, aes_cipher)
+    except Exception:
+        return False
 
 
 def ts() -> str:
@@ -100,18 +117,32 @@ def print_message(formatted_str: str):
 
 
 def get_e2ee_shared_key(target_user: str) -> Optional[bytes]:
-    """Retrieve or compute the cached ECDH shared key for a peer."""
-    if target_user in e2ee_keys_cache:
-        return e2ee_keys_cache[target_user]
-    user_info = online_users.get(target_user)
-    if not user_info or not user_info.get("pubkey"):
+    """Retrieve or compute the cached ECDH shared key for a peer (case-insensitive)."""
+    if not target_user:
         return None
-    try:
-        shared = derive_e2ee_shared_key(my_priv_key, user_info["pubkey"])
-        e2ee_keys_cache[target_user] = shared
-        return shared
-    except Exception:
-        return None
+
+    # Handle loopback if user tests with themselves
+    if target_user.lower() == my_username.lower():
+        try:
+            return derive_e2ee_shared_key(my_priv_key, my_pubkey_hex)
+        except Exception:
+            return None
+
+    # Check cache case-insensitively
+    for name, key in e2ee_keys_cache.items():
+        if name.lower() == target_user.lower():
+            return key
+
+    # Check online users case-insensitively
+    for name, user_info in online_users.items():
+        if name.lower() == target_user.lower() and user_info.get("pubkey"):
+            try:
+                shared = derive_e2ee_shared_key(my_priv_key, user_info["pubkey"])
+                e2ee_keys_cache[name] = shared
+                return shared
+            except Exception:
+                return None
+    return None
 
 
 # ============================================================
@@ -139,37 +170,57 @@ def discover_server(udp_port=DEFAULT_UDP_PORT, timeout=3) -> Optional[Tuple[str,
 
 
 # ============================================================
-# File Transfer Engine (Disk-to-Disk Streaming)
+# File & Voice Transfer Engine
 # ============================================================
 
 def format_size(bytes_num: int) -> str:
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if bytes_num < 1024.0:
-            return f"{bytes_num:.1f} {unit}"
-        bytes_num /= 1024.0
-    return f"{bytes_num:.1f} TB"
+    if bytes_num < 1024:
+        return f"{bytes_num} B"
+    num = float(bytes_num)
+    for unit in ['KB', 'MB', 'GB']:
+        num /= 1024.0
+        if num < 1024.0:
+            return f"{num:.1f} {unit}"
+    return f"{num:.1f} TB"
 
 
-def send_file_stream(filepath: str, target_user: Optional[str] = None):
+def send_file_stream(filepath: str, target_user: Optional[str] = None, is_voice_note: bool = False):
     if not os.path.isfile(filepath):
-        print_message(f"{RED}[Error] File not found: {filepath}{RESET}")
+        print_message(f"{RED}[Error] File not found: '{filepath}'. Please check the path.{RESET}")
         return
-
-    filename = os.path.basename(filepath)
-    print_message(f"{GRAY}[{ts()}]{RESET} {YELLOW}Hashing & preparing '{filename}'...{RESET}")
-    
-    filehash, filesize = compute_file_sha256(filepath)
-    num_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE if filesize > 0 else 1
-    transfer_id = str(uuid.uuid4())[:8]
 
     shared_key = None
     is_e2ee = False
     if target_user:
+        matched_target = None
+        if target_user.lower() == my_username.lower():
+            matched_target = my_username
+        else:
+            for name in online_users:
+                if name.lower() == target_user.lower():
+                    matched_target = name
+                    break
+
+        if not matched_target:
+            online_names = list(online_users.keys())
+            names_str = ", ".join(online_names) if online_names else "none"
+            print_message(f"{RED}[Error] User '{target_user}' is not online.\nOnline users: {names_str}\n(Type /users to check who is online).{RESET}")
+            return
+
+        target_user = matched_target
         shared_key = get_e2ee_shared_key(target_user)
         if not shared_key:
             print_message(f"{RED}[Error] Cannot establish E2EE session with '{target_user}'.{RESET}")
             return
         is_e2ee = True
+
+    filename = os.path.basename(filepath)
+    prefix = f"{YELLOW}Preparing Voice Note...{RESET}" if is_voice_note else f"{YELLOW}Hashing & preparing '{filename}'...{RESET}"
+    print_message(f"{GRAY}[{ts()}]{RESET} {prefix}")
+    
+    filehash, filesize = compute_file_sha256(filepath)
+    num_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE if filesize > 0 else 1
+    transfer_id = str(uuid.uuid4())[:8]
 
     # 1. Send FILE_START packet
     start_packet = {
@@ -181,16 +232,19 @@ def send_file_stream(filepath: str, target_user: Optional[str] = None):
         "num_chunks": num_chunks,
         "target": target_user,
         "room": current_room,
-        "is_e2ee": is_e2ee
+        "is_e2ee": is_e2ee,
+        "is_voice": is_voice_note
     }
-    send_json_packet(sock, start_packet, aes_cipher)
+    safe_send_packet(start_packet)
 
     dest_str = f"{MAGENTA}[E2EE Direct to @{target_user}]{RESET}" if is_e2ee else f"{CYAN}[Room {current_room}]{RESET}"
-    print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}Uploading '{filename}' ({format_size(filesize)}) {dest_str}...{RESET}")
+    action_name = "Voice Note" if is_voice_note else f"'{filename}'"
+    print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}Uploading {action_name} ({format_size(filesize)}) {dest_str}...{RESET}")
 
     # 2. Stream Chunks directly from disk
     sent_bytes = 0
     start_time = time.time()
+    elapsed = 0.0
     with open(filepath, "rb") as f:
         for idx in range(num_chunks):
             chunk = f.read(CHUNK_SIZE)
@@ -213,7 +267,7 @@ def send_file_stream(filepath: str, target_user: Optional[str] = None):
                 "target": target_user,
                 "room": current_room
             }
-            send_json_packet(sock, chunk_packet, aes_cipher)
+            safe_send_packet(chunk_packet)
             sent_bytes += len(chunk)
 
             # Live speed calculation
@@ -229,6 +283,8 @@ def send_file_stream(filepath: str, target_user: Optional[str] = None):
                 sys.stdout.write(f"\r  Sending [{bar}] {pct}% | {format_size(int(speed))}/s | {sent_bytes}/{filesize} bytes")
                 sys.stdout.flush()
 
+    elapsed = max(0.001, time.time() - start_time)
+
     # 3. Send FILE_END packet
     end_packet = {
         "type": "FILE_END",
@@ -236,11 +292,30 @@ def send_file_stream(filepath: str, target_user: Optional[str] = None):
         "target": target_user,
         "room": current_room
     }
-    send_json_packet(sock, end_packet, aes_cipher)
+    safe_send_packet(end_packet)
     
     with prompt_lock:
+        clear_prompt()
         print()
-        print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}[OK] Upload complete:{RESET} '{filename}' ({format_size(filesize)}) in {elapsed:.2f}s")
+    print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}[OK] Upload complete:{RESET} {action_name} ({format_size(filesize)}) in {elapsed:.2f}s")
+
+
+def record_and_send_voice(target_user: Optional[str] = None, duration_sec: int = 5):
+    """Record a voice memo from the microphone and send it."""
+    os.makedirs("temp_voice", exist_ok=True)
+    vpath = os.path.join("temp_voice", f"voice_{uuid.uuid4().hex[:8]}.wav")
+    print_message(f"{GRAY}[{ts()}]{RESET} {RED}🎙️ Recording voice note for {duration_sec}s... Speak into your mic!{RESET}")
+    
+    if not start_voice_recording():
+        print_message(f"{RED}[Error] Could not initialize microphone.{RESET}")
+        return
+
+    time.sleep(duration_sec)
+    ok = stop_voice_recording(vpath)
+    if ok and os.path.exists(vpath):
+        send_file_stream(vpath, target_user=target_user, is_voice_note=True)
+    else:
+        print_message(f"{YELLOW}[Warning] Voice recording failed or was empty.{RESET}")
 
 
 # ============================================================
@@ -254,6 +329,7 @@ def handle_incoming_file_start(packet: Dict[str, Any]):
     filehash = packet.get("filehash", "")
     sender = packet.get("sender", "Unknown")
     is_e2ee = bool(packet.get("is_e2ee", False))
+    is_voice = bool(packet.get("is_voice", False)) or filename.startswith("voice_")
     sender_pubkey = packet.get("sender_pubkey")
 
     shared_key = None
@@ -290,10 +366,11 @@ def handle_incoming_file_start(packet: Dict[str, Any]):
             "start_time": time.time(),
             "sender": sender,
             "is_e2ee": is_e2ee,
+            "is_voice": is_voice,
             "shared_key": shared_key
         }
 
-    tag = f"{MAGENTA}[E2EE Private File]{RESET}" if is_e2ee else f"{CYAN}[Room File]{RESET}"
+    tag = f"{BLUE}[🎙️ Voice Note]{RESET}" if is_voice else (f"{MAGENTA}[E2EE Private File]{RESET}" if is_e2ee else f"{CYAN}[Room File]{RESET}")
     print_message(f"{GRAY}[{ts()}]{RESET} {tag} Receiving '{filename}' ({format_size(filesize)}) from {BOLD}{sender}{RESET}...")
 
 
@@ -315,9 +392,10 @@ def handle_incoming_file_chunk(packet: Dict[str, Any]):
         else:
             chunk = raw_payload
 
-        transfer["file_obj"].write(chunk)
-        transfer["hasher"].update(chunk)
-        transfer["received_bytes"] += len(chunk)
+        if chunk:
+            transfer["file_obj"].write(chunk)
+            transfer["hasher"].update(chunk)
+            transfer["received_bytes"] += len(chunk)
 
         # Progress update
         rec = transfer["received_bytes"]
@@ -345,13 +423,20 @@ def handle_incoming_file_end(packet: Dict[str, Any]):
         transfer["file_obj"].close()
         actual_hash = transfer["hasher"].hexdigest()
         ok = (actual_hash == transfer["expected_hash"])
+        is_voice = transfer.get("is_voice", False)
+        fpath = transfer["filepath"]
 
         with prompt_lock:
+            clear_prompt()
             print()
             if ok:
-                print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}[OK] Download complete:{RESET} '{transfer['filepath']}' {GREEN}[SHA-256 Verified]{RESET}")
+                if is_voice:
+                    print_message(f"{GRAY}[{ts()}]{RESET} {BLUE}🎙️ [Voice Note received from @{transfer['sender']}]:{RESET} Type {BOLD}/play {os.path.basename(fpath)}{RESET} to listen!")
+                    play_audio_file(fpath)
+                else:
+                    print_message(f"{GRAY}[{ts()}]{RESET} {GREEN}[OK] Download complete:{RESET} '{fpath}' {GREEN}[SHA-256 Verified]{RESET}")
             else:
-                print_message(f"{GRAY}[{ts()}]{RESET} {RED}[FAIL] Download corrupted:{RESET} '{transfer['filepath']}' {RED}[Hash Mismatch]{RESET}")
+                print_message(f"{GRAY}[{ts()}]{RESET} {RED}[FAIL] Download corrupted:{RESET} '{fpath}' {RED}[Hash Mismatch]{RESET}")
 
 
 def receiver_loop():
@@ -359,7 +444,7 @@ def receiver_loop():
     while True:
         packet = recv_json_packet(sock, aes_cipher)
         if packet is None:
-            print_message(f"\n{RED}[Disconnected from server - connection lost or key mismatch]{RESET}")
+            print_message(f"\n{RED}[Disconnected from server]{RESET}")
             os._exit(0)
 
         ptype = packet.get("type")
@@ -413,9 +498,8 @@ def receiver_loop():
         elif ptype == "USERLIST":
             raw_users = packet.get("users", [])
             online_users = {u["username"]: u for u in raw_users}
-            # Auto-compute shared keys for peers
             for u in raw_users:
-                if u["username"] != my_username and u.get("pubkey"):
+                if u["username"].lower() != my_username.lower() and u.get("pubkey"):
                     try:
                         e2ee_keys_cache[u["username"]] = derive_e2ee_shared_key(my_priv_key, u["pubkey"])
                     except Exception:
@@ -423,7 +507,6 @@ def receiver_loop():
 
         elif ptype == "TYPING":
             sender = packet.get("sender")
-            room = packet.get("room")
             is_typing = packet.get("is_typing", False)
             if is_typing:
                 print_message(f"{DIM}{GRAY}* {sender} is typing...{RESET}")
@@ -434,7 +517,10 @@ def receiver_loop():
             my_rooms.add(joined_room)
             print_message(f"{GREEN}Switched to room {BOLD}{current_room}{RESET}")
 
-        elif ptype == "FILE_START" or ptype == "PFILE_START":
+        elif ptype == "PING":
+            safe_send_packet({"type": "PONG"})
+
+        elif ptype in ("FILE_START", "PFILE_START"):
             handle_incoming_file_start(packet)
 
         elif ptype == "FILE_CHUNK":
@@ -443,9 +529,6 @@ def receiver_loop():
         elif ptype == "FILE_END":
             handle_incoming_file_end(packet)
 
-        elif ptype == "PING":
-            send_json_packet(sock, {"type": "PONG"}, aes_cipher)
-
 
 # ============================================================
 # Help & Interactive Commands
@@ -453,20 +536,23 @@ def receiver_loop():
 
 def print_help():
     help_text = f"""
-{BOLD}{CYAN}=== COMMAND REFERENCE ==={RESET}
-  {BOLD}<text>{RESET}                     Send message to active room ({CYAN}{current_room}{RESET})
-  {BOLD}/msg <user> <text>{RESET}         Send Zero-Knowledge E2EE private message to @user
-  {BOLD}/file <path>{RESET}               Stream file upload to current room
-  {BOLD}/fileto <user> <path>{RESET}      Send Zero-Knowledge E2EE private file to @user
-  {BOLD}/join <#room>{RESET}             Join or switch to a chat room (#general, #dev, #random, etc.)
-  {BOLD}/leave <#room>{RESET}            Leave a chat room
-  {BOLD}/rooms{RESET}                    List active joined rooms
-  {BOLD}/status <online|away|busy>{RESET} Change your presence status
-  {BOLD}/list or /users{RESET}           View online users, statuses, and E2EE lock status
-  {BOLD}/whoami{RESET}                   Show your username, public key fingerprint & active room
-  {BOLD}/clear{RESET}                    Clear terminal screen
-  {BOLD}/help{RESET}                     Show this command list
-  {BOLD}/quit{RESET}                     Disconnect and exit
+{BOLD}{CYAN}=== SECURE LAN CHAT (v4.5) COMMAND REFERENCE ==={RESET}
+  {BOLD}<text>{RESET}                            Send message to active room ({CYAN}{current_room}{RESET})
+  {BOLD}/msg <user> <text>{RESET}                Send Zero-Knowledge E2EE private message to @user
+  {BOLD}/file <path>{RESET}                      Stream file upload to current room
+  {BOLD}/fileto <user> <path>{RESET}             Send Zero-Knowledge E2EE private file to @user
+  {BOLD}/voice [sec]{RESET}                      Record & send Voice Note to room (default: 5s)
+  {BOLD}/voiceto <user> [sec]{RESET}            Send E2EE encrypted Voice Note to @user
+  {BOLD}/play <filename/path>{RESET}            Play a downloaded voice note or WAV file
+  {BOLD}/join <#room>{RESET}                    Join or switch to a chat room (#general, #dev, #random)
+  {BOLD}/leave <#room>{RESET}                   Leave a chat room
+  {BOLD}/rooms{RESET}                           List active joined rooms
+  {BOLD}/status <online|away|busy>{RESET}        Change your presence status
+  {BOLD}/list or /users{RESET}                  View online users, statuses, and E2EE readiness
+  {BOLD}/whoami{RESET}                          Show your username, key fingerprint & active room
+  {BOLD}/clear{RESET}                           Clear terminal screen
+  {BOLD}/help{RESET}                            Show this command list
+  {BOLD}/quit{RESET}                            Disconnect and exit
 """
     print_message(help_text)
 
@@ -477,7 +563,7 @@ def print_users():
         st = data.get("status", "online")
         st_color = GREEN if st == "online" else (YELLOW if st == "away" else RED)
         e2ee_badge = f"{GREEN}[E2EE Ready]{RESET}" if name in e2ee_keys_cache or name == my_username else f"{GRAY}[Standard]{RESET}"
-        you_badge = f" {CYAN}(You){RESET}" if name == my_username else ""
+        you_badge = f" {CYAN}(You){RESET}" if name.lower() == my_username.lower() else ""
         rooms_str = ", ".join(data.get("rooms", []))
         lines.append(f"  * {st_color}[{st[0].upper()}]{RESET} {BOLD}{name}{RESET}{you_badge} - {st_color}{st}{RESET} {e2ee_badge} (in {rooms_str})")
     print_message("\n".join(lines) + "\n")
@@ -495,7 +581,7 @@ def main():
     aes_cipher = AESGCM(aes_key)
 
     print("=" * 65)
-    print("      SECURE LAN CHAT & FILE TRANSFER - CLIENT v4")
+    print("      SECURE LAN CHAT & FILE TRANSFER - CLIENT v4.5")
     print("=" * 65)
 
     if len(sys.argv) >= 3:
@@ -528,7 +614,7 @@ def main():
         "username": my_username,
         "pubkey": my_pubkey_hex
     }
-    send_json_packet(sock, join_packet, aes_cipher)
+    safe_send_packet(join_packet)
 
     # Start background receiver
     threading.Thread(target=receiver_loop, daemon=True).start()
@@ -572,7 +658,7 @@ def main():
             elif text.startswith("/status "):
                 st = text.split(" ", 1)[1].strip().lower()
                 if st in ("online", "away", "busy"):
-                    send_json_packet(sock, {"type": "STATUS", "status": st}, aes_cipher)
+                    safe_send_packet({"type": "STATUS", "status": st})
                     print_message(f"Status set to {BOLD}{st}{RESET}")
                 else:
                     print_message(f"{YELLOW}Usage: /status <online|away|busy>{RESET}")
@@ -581,7 +667,7 @@ def main():
                 r = text.split(" ", 1)[1].strip()
                 if not r.startswith("#"):
                     r = "#" + r
-                send_json_packet(sock, {"type": "ROOM_JOIN", "room": r}, aes_cipher)
+                safe_send_packet({"type": "ROOM_JOIN", "room": r})
 
             elif text.startswith("/leave "):
                 r = text.split(" ", 1)[1].strip()
@@ -590,7 +676,7 @@ def main():
                 if r == "#general":
                     print_message(f"{YELLOW}Cannot leave #general room.{RESET}")
                 else:
-                    send_json_packet(sock, {"type": "ROOM_LEAVE", "room": r}, aes_cipher)
+                    safe_send_packet({"type": "ROOM_LEAVE", "room": r})
                     my_rooms.discard(r)
                     if current_room == r:
                         current_room = "#general"
@@ -603,9 +689,25 @@ def main():
                     print_message(f"{YELLOW}Usage: /msg <username> <message>{RESET}")
                     continue
 
+                matched_target = None
+                if target.lower() == my_username.lower():
+                    matched_target = my_username
+                else:
+                    for name in online_users:
+                        if name.lower() == target.lower():
+                            matched_target = name
+                            break
+
+                if not matched_target:
+                    online_names = list(online_users.keys())
+                    names_str = ", ".join(online_names) if online_names else "none"
+                    print_message(f"{RED}[Error] User '{target}' is not online.\nOnline users: {names_str}\n(Type /users to check who is online).{RESET}")
+                    continue
+
+                target = matched_target
                 shared_key = get_e2ee_shared_key(target)
                 if not shared_key:
-                    print_message(f"{RED}[Error] User '{target}' not found or has no E2EE public key.{RESET}")
+                    print_message(f"{RED}[Error] User '{target}' has no E2EE public key ready.{RESET}")
                     continue
 
                 enc_content = e2ee_encrypt_payload(shared_key, msg)
@@ -614,7 +716,7 @@ def main():
                     "target": target,
                     "content": enc_content
                 }
-                send_json_packet(sock, pmsg_packet, aes_cipher)
+                safe_send_packet(pmsg_packet)
                 print_message(f"{GRAY}[{ts()}]{RESET} {MAGENTA}[E2EE Direct to @{target}]{RESET} {msg}")
 
             elif text.startswith("/fileto "):
@@ -623,11 +725,31 @@ def main():
                 except ValueError:
                     print_message(f"{YELLOW}Usage: /fileto <username> <filepath>{RESET}")
                     continue
-                threading.Thread(target=send_file_stream, args=(path, target), daemon=True).start()
+                threading.Thread(target=send_file_stream, args=(path, target, False), daemon=True).start()
 
             elif text.startswith("/file "):
                 path = text[6:].strip()
-                threading.Thread(target=send_file_stream, args=(path, None), daemon=True).start()
+                threading.Thread(target=send_file_stream, args=(path, None, False), daemon=True).start()
+
+            elif text.startswith("/voiceto "):
+                parts = text.split(" ")
+                target = parts[1] if len(parts) > 1 else ""
+                sec = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+                threading.Thread(target=record_and_send_voice, args=(target, sec), daemon=True).start()
+
+            elif text.startswith("/voice"):
+                parts = text.split(" ")
+                sec = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 5
+                threading.Thread(target=record_and_send_voice, args=(None, sec), daemon=True).start()
+
+            elif text.startswith("/play "):
+                f_name = text[6:].strip()
+                target_p = f_name if os.path.exists(f_name) else os.path.join(DOWNLOADS_DIR, f_name)
+                if os.path.exists(target_p):
+                    print_message(f"{GRAY}[{ts()}]{RESET} {BLUE}▶ Playing audio '{os.path.basename(target_p)}'...{RESET}")
+                    play_audio_file(target_p)
+                else:
+                    print_message(f"{RED}[Error] Audio file not found: '{f_name}'{RESET}")
 
             else:
                 # Regular room message
@@ -636,7 +758,7 @@ def main():
                     "room": current_room,
                     "content": text
                 }
-                send_json_packet(sock, msg_packet, aes_cipher)
+                safe_send_packet(msg_packet)
                 print_message(f"{GRAY}[{ts()}]{RESET} {CYAN}[{current_room}]{RESET} {BOLD}{my_username}{RESET}: {text}")
 
             render_prompt()

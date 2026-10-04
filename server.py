@@ -28,7 +28,8 @@ from crypto_utils import (
     derive_transport_key,
     send_json_packet,
     recv_json_packet,
-    sanitize_filename
+    sanitize_filename,
+    log_chat_history_to_file
 )
 
 # Configuration defaults
@@ -91,6 +92,10 @@ def init_database():
 
 def db_log_message(room: Optional[str], sender: str, target: Optional[str], content: str, is_private: bool = False):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if is_private:
+        log_chat_history_to_file(f"[E2EE Private] {sender} -> @{target}: {content}")
+    else:
+        log_chat_history_to_file(f"[{room or '#general'}] {sender}: {content}")
     with db_lock:
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -107,6 +112,10 @@ def db_log_message(room: Optional[str], sender: str, target: Optional[str], cont
 
 def db_log_file_transfer(sender: str, target: Optional[str], room: Optional[str], filename: str, filesize: int, filehash: str):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if target:
+        log_chat_history_to_file(f"[File Transfer - Direct] {sender} -> @{target}: '{filename}' ({filesize} bytes, SHA256: {filehash[:12]}...)")
+    else:
+        log_chat_history_to_file(f"[File Transfer - {room or '#general'}] {sender}: '{filename}' ({filesize} bytes, SHA256: {filehash[:12]}...)")
     with db_lock:
         try:
             conn = sqlite3.connect(DB_FILE)
@@ -147,9 +156,12 @@ def log_event(event_str: str):
 
 
 def find_client_by_name(username: str) -> Optional[Dict[str, Any]]:
+    if not username:
+        return None
+    clean_target = str(username).lstrip("@").strip().lower()
     with clients_lock:
         for c in clients:
-            if c["username"] == username:
+            if c["username"].lstrip("@").strip().lower() == clean_target:
                 return c
     return None
 
@@ -167,6 +179,22 @@ def get_user_list_payload() -> List[Dict[str, Any]]:
         ]
 
 
+def send_client_packet(client_entry: Dict[str, Any], packet_dict: Dict[str, Any], aes_cipher: AESGCM) -> bool:
+    """Thread-safe encrypted packet sending to a specific client."""
+    lock = client_entry.get("lock")
+    conn = client_entry.get("conn")
+    if not conn:
+        return False
+    try:
+        if lock:
+            with lock:
+                return send_json_packet(conn, packet_dict, aes_cipher)
+        else:
+            return send_json_packet(conn, packet_dict, aes_cipher)
+    except Exception:
+        return False
+
+
 def broadcast_userlist(aes_cipher: AESGCM):
     users = get_user_list_payload()
     packet = {
@@ -174,16 +202,16 @@ def broadcast_userlist(aes_cipher: AESGCM):
         "users": users
     }
     with clients_lock:
-        target_conns = [c["conn"] for c in clients]
-    for conn in target_conns:
-        send_json_packet(conn, packet, aes_cipher)
+        target_clients = list(clients)
+    for c in target_clients:
+        send_client_packet(c, packet, aes_cipher)
 
 
 def broadcast_to_room(room: str, packet: Dict[str, Any], aes_cipher: AESGCM, exclude_conn=None):
     with clients_lock:
-        targets = [c["conn"] for c in clients if room in c.get("rooms", set()) and c["conn"] is not exclude_conn]
-    for conn in targets:
-        send_json_packet(conn, packet, aes_cipher)
+        targets = [c for c in clients if room in c.get("rooms", set()) and c["conn"] is not exclude_conn]
+    for c in targets:
+        send_client_packet(c, packet, aes_cipher)
 
 
 def broadcast_system_msg(text: str, room: Optional[str], aes_cipher: AESGCM, exclude_conn=None):
@@ -197,9 +225,9 @@ def broadcast_system_msg(text: str, room: Optional[str], aes_cipher: AESGCM, exc
         broadcast_to_room(room, packet, aes_cipher, exclude_conn=exclude_conn)
     else:
         with clients_lock:
-            targets = [c["conn"] for c in clients if c["conn"] is not exclude_conn]
-        for conn in targets:
-            send_json_packet(conn, packet, aes_cipher)
+            targets = [c for c in clients if c["conn"] is not exclude_conn]
+        for c in targets:
+            send_client_packet(c, packet, aes_cipher)
 
 
 def remove_client(conn, aes_cipher: AESGCM):
@@ -221,6 +249,7 @@ def remove_client(conn, aes_cipher: AESGCM):
 # ============================================================
 
 def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
+    conn_lock = threading.Lock()
     # Initial Handshake packet expected: {"type": "JOIN", "username": "...", "pubkey": "..."}
     handshake = recv_json_packet(conn, aes_cipher)
     if not handshake or handshake.get("type") != "JOIN":
@@ -231,13 +260,15 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
     pubkey = str(handshake.get("pubkey", "")).strip()
 
     if not username or len(username) > 30:
-        send_json_packet(conn, {"type": "ERR", "content": "Invalid username."}, aes_cipher)
+        with conn_lock:
+            send_json_packet(conn, {"type": "ERR", "content": "Invalid username."}, aes_cipher)
         conn.close()
         return
 
     with clients_lock:
         if any(c["username"].lower() == username.lower() for c in clients):
-            send_json_packet(conn, {"type": "ERR", "content": f"Username '{username}' is already taken."}, aes_cipher)
+            with conn_lock:
+                send_json_packet(conn, {"type": "ERR", "content": f"Username '{username}' is already taken."}, aes_cipher)
             conn.close()
             return
 
@@ -248,14 +279,15 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
             "pubkey": pubkey,
             "rooms": {"#general"},
             "status": "online",
-            "last_seen": time.time()
+            "last_seen": time.time(),
+            "lock": conn_lock
         }
         clients.append(client_entry)
 
     log_event(f"[+] {username} joined from {addr[0]}:{addr[1]}")
 
     # Confirm join to client
-    send_json_packet(conn, {
+    send_client_packet(client_entry, {
         "type": "JOIN_OK",
         "username": username,
         "rooms": ["#general", "#dev", "#random"],
@@ -265,7 +297,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
     # Replay #general history
     history = db_get_room_history("#general", limit=25)
     for h in history:
-        send_json_packet(conn, {
+        send_client_packet(client_entry, {
             "type": "HIST",
             "room": "#general",
             "sender": h["sender"],
@@ -311,7 +343,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
 
                 target_client = find_client_by_name(target)
                 if not target_client:
-                    send_json_packet(conn, {"type": "ERR", "content": f"User '{target}' is not online."}, aes_cipher)
+                    send_client_packet(client_entry, {"type": "ERR", "content": f"User '{target}' is not online."}, aes_cipher)
                     continue
 
                 log_event(f"[E2EE PM] {username} -> {target}")
@@ -325,7 +357,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                     "sender_pubkey": pubkey,
                     "timestamp": ts
                 }
-                send_json_packet(target_client["conn"], out_packet, aes_cipher)
+                send_client_packet(target_client, out_packet, aes_cipher)
 
             # 3. Room Management (/join, /leave, /rooms)
             elif ptype == "ROOM_JOIN":
@@ -337,7 +369,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                 # Replay room history
                 hist = db_get_room_history(target_room, limit=25)
                 for h in hist:
-                    send_json_packet(conn, {
+                    send_client_packet(client_entry, {
                         "type": "HIST",
                         "room": target_room,
                         "sender": h["sender"],
@@ -345,7 +377,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                         "timestamp": h["timestamp"]
                     }, aes_cipher)
 
-                send_json_packet(conn, {
+                send_client_packet(client_entry, {
                     "type": "ROOM_JOINED",
                     "room": target_room
                 }, aes_cipher)
@@ -380,7 +412,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                 if target:
                     tc = find_client_by_name(target)
                     if tc:
-                        send_json_packet(tc["conn"], out_packet, aes_cipher)
+                        send_client_packet(tc, out_packet, aes_cipher)
                 elif room:
                     broadcast_to_room(room, out_packet, aes_cipher, exclude_conn=conn)
 
@@ -401,10 +433,10 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                 if ptype == "PFILE_START" or target:
                     tc = find_client_by_name(target)
                     if not tc:
-                        send_json_packet(conn, {"type": "ERR", "content": f"User '{target}' is offline for file transfer."}, aes_cipher)
+                        send_client_packet(client_entry, {"type": "ERR", "content": f"User '{target}' is offline for file transfer."}, aes_cipher)
                         continue
                     log_event(f"[File] {username} -> {target} (E2EE): '{filename}' ({filesize:,} bytes, {num_chunks} chunks)")
-                    send_json_packet(tc["conn"], packet, aes_cipher)
+                    send_client_packet(tc, packet, aes_cipher)
                 else:
                     log_event(f"[File] {username} -> {room}: '{filename}' ({filesize:,} bytes, {num_chunks} chunks)")
                     broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
@@ -420,7 +452,7 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                 if target:
                     tc = find_client_by_name(target)
                     if tc:
-                        send_json_packet(tc["conn"], packet, aes_cipher)
+                        send_client_packet(tc, packet, aes_cipher)
                 else:
                     broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
 
@@ -433,13 +465,13 @@ def handle_client(conn: socket.socket, addr, aes_cipher: AESGCM):
                 if target:
                     tc = find_client_by_name(target)
                     if tc:
-                        send_json_packet(tc["conn"], packet, aes_cipher)
+                        send_client_packet(tc, packet, aes_cipher)
                 else:
                     broadcast_to_room(room, packet, aes_cipher, exclude_conn=conn)
 
             # 9. Heartbeat Ping / Pong
             elif ptype == "PING":
-                send_json_packet(conn, {"type": "PONG", "ts": time.time()}, aes_cipher)
+                send_client_packet(client_entry, {"type": "PONG", "ts": time.time()}, aes_cipher)
 
             elif ptype == "PONG":
                 client_entry["last_seen"] = time.time()
@@ -461,19 +493,16 @@ def heartbeat_watchdog(aes_cipher: AESGCM):
     while True:
         time.sleep(15)
         now = time.time()
-        stale_conns = []
+        stale_clients = []
         with clients_lock:
             for c in clients:
-                if now - c.get("last_seen", now) > 45:
-                    stale_conns.append(c["conn"])
+                if now - c.get("last_seen", now) > 60:
+                    stale_clients.append(c)
                 else:
-                    try:
-                        send_json_packet(c["conn"], {"type": "PING"}, aes_cipher)
-                    except Exception:
-                        stale_conns.append(c["conn"])
-        for dead_conn in stale_conns:
+                    send_client_packet(c, {"type": "PING"}, aes_cipher)
+        for dead_c in stale_clients:
             try:
-                dead_conn.close()
+                dead_c["conn"].close()
             except OSError:
                 pass
 

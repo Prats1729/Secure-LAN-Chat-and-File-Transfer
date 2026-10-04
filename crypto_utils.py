@@ -13,6 +13,8 @@ import sys
 import json
 import base64
 import hashlib
+import threading
+import datetime
 from typing import Optional, Tuple, Dict, Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -214,3 +216,66 @@ def compute_file_sha256(filepath: str) -> Tuple[str, int]:
             hasher.update(chunk)
             total_size += len(chunk)
     return hasher.hexdigest(), total_size
+
+
+# --- Voice Audio Recording & Playback (Windows WinMM Native) ---
+
+def start_voice_recording(alias: str = "lanchat_rec") -> bool:
+    """Start microphone audio recording."""
+    try:
+        import ctypes
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "winmm"):
+            mci = ctypes.windll.winmm.mciSendStringW
+            mci(f"close {alias}", None, 0, None)
+            mci(f"open new type waveaudio alias {alias}", None, 0, None)
+            mci(f"set {alias} time format ms", None, 0, None)
+            mci(f"set {alias} bitspersample 16", None, 0, None)
+            mci(f"set {alias} channels 1", None, 0, None)
+            mci(f"set {alias} samplespersec 16000", None, 0, None)
+            mci(f"record {alias}", None, 0, None)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def stop_voice_recording(output_wav_path: str, alias: str = "lanchat_rec") -> bool:
+    """Stop microphone audio recording and save to WAV file."""
+    try:
+        import ctypes
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "winmm"):
+            mci = ctypes.windll.winmm.mciSendStringW
+            mci(f"save {alias} \"{output_wav_path}\"", None, 0, None)
+            mci(f"close {alias}", None, 0, None)
+            return os.path.isfile(output_wav_path) and os.path.getsize(output_wav_path) > 44
+    except Exception:
+        pass
+    return False
+
+
+def play_audio_file(wav_path: str) -> bool:
+    """Play a WAV audio file asynchronously."""
+    try:
+        if os.path.exists(wav_path):
+            import winsound
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# --- Persistent Text File Chat & File History Logger ---
+
+HISTORY_FILE = "chat_history.txt"
+history_file_lock = threading.Lock()
+
+def log_chat_history_to_file(entry: str, filepath: str = HISTORY_FILE):
+    """Append a timestamped message/event to the persistent chat_history.txt file in the project folder."""
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with history_file_lock:
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {entry}\n")
+    except Exception as e:
+        pass

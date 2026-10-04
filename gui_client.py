@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-Secure LAN Chat & File Transfer - MODERN DESKTOP GUI CLIENT (v4)
-Built with Tkinter (zero external GUI dependencies).
+Secure LAN Chat & File Transfer - ADVANCED DESKTOP GUI CLIENT (v4.5)
 Features:
-- Dark Modern Glassmorphic Theme
-- UDP Auto-Discovery & Manual Connection Modal
-- Multi-Room Channels (#general, #dev, #random, +Custom Room)
-- Tabbed Direct Messages (DMs) with Zero-Knowledge E2EE Indicators
-- Live User Presence Sidebar (🟢 Online, 🟡 Away, 🔴 Busy)
-- Disk-to-Disk Streaming File Transfer with Progress Bars & Speedometers
-- Real-time Typing Indicators
-- Downloads Folder Quick-Access
+- Dark Modern Theme with Glassmorphic styling
+- Multi-Room Channel Tabs & E2EE Direct Messages (DMs) with Isolated Chat History
+- Real-time notification banners for incoming private messages and files across tabs
+- Persistent file logging to chat_history.txt in project folder
+- Live Voice Note Recording & Playback (saved in voice_notes/ and downloads/)
+- Live User Presence (🟢 Online, 🟡 Away, 🔴 Busy) & Typing Indicators
+- Disk-to-Disk Streaming File Transfer with Speedometers & SHA-256 Verification
+- File Transfer Audit & History Manager
+- UDP LAN Server Auto-Discovery
 """
 
 import socket
 import threading
 import sys
 import os
+import shutil
 import time
 import base64
 import uuid
 import datetime
+from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from crypto_utils import (
@@ -39,12 +41,17 @@ from crypto_utils import (
     sanitize_filename,
     get_unique_filepath,
     compute_file_sha256,
+    start_voice_recording,
+    stop_voice_recording,
+    play_audio_file,
+    log_chat_history_to_file,
     CHUNK_SIZE
 )
 
 DEFAULT_PASSPHRASE = "SecureLANChat2026"
 DEFAULT_UDP_PORT = 5051
 DOWNLOADS_DIR = "downloads"
+VOICE_DIR = "voice_notes"
 UDP_DISCOVER_MSG = b"LANCHAT_DISCOVER"
 
 # Theme Colors
@@ -64,14 +71,15 @@ TEXT_MUTED = "#9ca3af"
 class SecureChatGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Secure LAN Chat & File Transfer - E2EE v4")
-        self.geometry("1020x680")
-        self.minsize(800, 500)
+        self.title("Secure LAN Chat & File Transfer - E2EE v4.5")
+        self.geometry("1060x700")
+        self.minsize(850, 550)
         self.configure(bg=BG_DARK)
 
         # Network & Crypto State
         self.sock: Optional[socket.socket] = None
         self.aes_cipher: Optional[AESGCM] = None
+        self.send_lock = threading.RLock()
         self.my_priv_key, self.my_pubkey_hex = generate_ecdh_keypair()
         self.my_username = ""
         self.current_target = "#general"  # Either "#room" or "@username"
@@ -79,14 +87,36 @@ class SecureChatGUI(tk.Tk):
         self.online_users: Dict[str, Dict[str, Any]] = {}
         self.e2ee_keys_cache: Dict[str, bytes] = {}
 
-        # Transfer & State Management
+        # Chat & History State (Isolated per room / DM)
+        self.chat_histories = defaultdict(list)  # target -> list of item dicts
+        self.unread_counts = defaultdict(int)    # target -> int
+        self.file_transfers: List[Dict[str, Any]] = []  # list of transfer records
+
+        # File & Voice State
         self.active_downloads: Dict[str, Dict[str, Any]] = {}
-        self.active_transfers_lock = threading.Lock()
+        self.active_transfers_lock = threading.RLock()
+        self.is_recording_voice = False
+        self.temp_voice_file = ""
+        self.voice_record_start_time = 0.0
+        self.voice_timer_id = None
         self.typing_timer = None
         self.is_typing = False
 
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        os.makedirs(VOICE_DIR, exist_ok=True)
+
         self._setup_styles()
         self._build_login_ui()
+
+    def _send_packet(self, packet_dict: Dict[str, Any]) -> bool:
+        """Thread-safe socket frame sender."""
+        if not self.sock or not self.aes_cipher:
+            return False
+        try:
+            with self.send_lock:
+                return send_json_packet(self.sock, packet_dict, self.aes_cipher)
+        except Exception:
+            return False
 
     def _setup_styles(self):
         style = ttk.Style(self)
@@ -99,6 +129,8 @@ class SecureChatGUI(tk.Tk):
         style.map("Accent.TButton", background=[("active", "#2563eb")])
         style.configure("Green.TButton", background=ACCENT_GREEN, foreground=TEXT_WHITE, font=("Segoe UI", 10, "bold"), borderwidth=0)
         style.map("Green.TButton", background=[("active", "#059669")])
+        style.configure("Red.TButton", background=ACCENT_RED, foreground=TEXT_WHITE, font=("Segoe UI", 10, "bold"), borderwidth=0)
+        style.map("Red.TButton", background=[("active", "#dc2626")])
 
     # ============================================================
     # Login & Connection Screen
@@ -112,7 +144,7 @@ class SecureChatGUI(tk.Tk):
         card.pack()
 
         tk.Label(card, text="🛡️ SECURE LAN CHAT", font=("Segoe UI", 18, "bold"), bg=BG_SIDEBAR, fg=ACCENT_BLUE).pack(pady=(0, 5))
-        tk.Label(card, text="AES-256-GCM + X25519 Zero-Knowledge E2EE", font=("Segoe UI", 9), bg=BG_SIDEBAR, fg=TEXT_MUTED).pack(pady=(0, 20))
+        tk.Label(card, text="AES-256-GCM + X25519 E2EE + Voice Notes", font=("Segoe UI", 9), bg=BG_SIDEBAR, fg=TEXT_MUTED).pack(pady=(0, 20))
 
         # Username Input
         tk.Label(card, text="Your Username:", font=("Segoe UI", 10, "bold"), bg=BG_SIDEBAR, fg=TEXT_WHITE).pack(anchor="w")
@@ -210,7 +242,7 @@ class SecureChatGUI(tk.Tk):
             "username": self.my_username,
             "pubkey": self.my_pubkey_hex
         }
-        send_json_packet(self.sock, join_packet, self.aes_cipher)
+        self._send_packet(join_packet)
 
         self.login_frame.destroy()
         self._build_main_chat_ui()
@@ -226,7 +258,7 @@ class SecureChatGUI(tk.Tk):
         self.main_container.pack(fill="both", expand=True)
 
         # 1. Left Sidebar (Rooms, Users, Presence)
-        self.sidebar = tk.Frame(self.main_container, bg=BG_SIDEBAR, width=240)
+        self.sidebar = tk.Frame(self.main_container, bg=BG_SIDEBAR, width=250)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
@@ -246,8 +278,7 @@ class SecureChatGUI(tk.Tk):
         self.room_listbox = tk.Listbox(self.sidebar, bg=BG_SIDEBAR, fg=TEXT_WHITE, selectbackground=ACCENT_BLUE, selectforeground=TEXT_WHITE, bd=0, highlightthickness=0, font=("Segoe UI", 10), height=5)
         self.room_listbox.pack(fill="x", padx=8)
         self.room_listbox.bind("<<ListboxSelect>>", self._on_room_select)
-        for r in sorted(self.joined_rooms):
-            self.room_listbox.insert(tk.END, r)
+        self._refresh_sidebar_rooms()
 
         btn_add_room = tk.Button(self.sidebar, text="+ Join Room", bg=BG_INPUT, fg=TEXT_MUTED, font=("Segoe UI", 8), relief="flat", command=self._prompt_join_room)
         btn_add_room.pack(anchor="w", padx=12, pady=(4, 10))
@@ -258,88 +289,230 @@ class SecureChatGUI(tk.Tk):
         self.user_listbox.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.user_listbox.bind("<<ListboxSelect>>", self._on_user_select)
 
-        # Downloads folder button
-        btn_folder = tk.Button(self.sidebar, text="📁 Open Downloads", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._open_downloads_dir)
-        btn_folder.pack(fill="x", padx=10, pady=(0, 10), ipady=4)
+        # Utility Buttons
+        btn_box = tk.Frame(self.sidebar, bg=BG_SIDEBAR, padx=8, pady=8)
+        btn_box.pack(fill="x")
+
+        btn_history = tk.Button(btn_box, text="📋 Transfer History", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._show_transfer_history)
+        btn_history.pack(fill="x", pady=(0, 4), ipady=3)
+
+        btn_folder = tk.Button(btn_box, text="📁 Open Downloads", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._open_downloads_dir)
+        btn_folder.pack(fill="x", pady=(0, 4), ipady=3)
+
+        btn_voice_folder = tk.Button(btn_box, text="🎙️ Open Voice Notes", bg=BG_INPUT, fg="#38bdf8", font=("Segoe UI", 9), relief="flat", command=self._open_voice_dir)
+        btn_voice_folder.pack(fill="x", ipady=3)
 
         # 2. Right Chat Area
         self.chat_pane = tk.Frame(self.main_container, bg=BG_CHAT)
         self.chat_pane.pack(side="right", fill="both", expand=True)
 
         # Header Bar
-        self.header_bar = tk.Frame(self.chat_pane, bg=BG_SIDEBAR, height=48, padx=15)
+        self.header_bar = tk.Frame(self.chat_pane, bg=BG_SIDEBAR, height=52, padx=15)
         self.header_bar.pack(fill="x")
-        self.lbl_target = tk.Label(self.header_bar, text="#general", font=("Segoe UI", 13, "bold"), bg=BG_SIDEBAR, fg=TEXT_WHITE)
-        self.lbl_target.pack(side="left", pady=10)
+        self.lbl_target = tk.Label(self.header_bar, text="#general", font=("Segoe UI", 13, "bold"), bg=BG_SIDEBAR, fg=ACCENT_BLUE)
+        self.lbl_target.pack(side="left", pady=12)
         self.lbl_sec_badge = tk.Label(self.header_bar, text="🛡️ AES-GCM Transport Encrypted", font=("Segoe UI", 9), bg=BG_SIDEBAR, fg=ACCENT_GREEN)
-        self.lbl_sec_badge.pack(side="right", pady=10)
+        self.lbl_sec_badge.pack(side="right", pady=12)
 
         # Messages Display Box
-        self.msg_box = tk.Text(self.chat_pane, bg=BG_CHAT, fg=TEXT_WHITE, font=("Segoe UI", 10), bd=0, highlightthickness=0, wrap="word", state="disabled", padx=12, pady=10)
+        self.msg_box = tk.Text(self.chat_pane, bg=BG_CHAT, fg=TEXT_WHITE, font=("Segoe UI", 10), bd=0, highlightthickness=0, wrap="word", state="disabled", padx=14, pady=10)
         self.msg_box.pack(fill="both", expand=True)
 
         # Color Tags for Text Styling
         self.msg_box.tag_configure("time", foreground=TEXT_MUTED, font=("Segoe UI", 8))
         self.msg_box.tag_configure("user", foreground=ACCENT_BLUE, font=("Segoe UI", 10, "bold"))
         self.msg_box.tag_configure("e2ee_user", foreground=ACCENT_MAGENTA, font=("Segoe UI", 10, "bold"))
+        self.msg_box.tag_configure("dm_alert", foreground="#f43f5e", font=("Segoe UI", 10, "bold"))
         self.msg_box.tag_configure("sys", foreground=ACCENT_GREEN, font=("Segoe UI", 9, "italic"))
         self.msg_box.tag_configure("err", foreground=ACCENT_RED, font=("Segoe UI", 9, "bold"))
         self.msg_box.tag_configure("hist", foreground=TEXT_MUTED)
         self.msg_box.tag_configure("file", foreground=ACCENT_YELLOW, font=("Segoe UI", 9, "bold"))
+        self.msg_box.tag_configure("voice", foreground="#38bdf8", font=("Segoe UI", 10, "bold"))
 
         # Live Typing & Transfer Status Bar
-        self.lbl_typing = tk.Label(self.chat_pane, text="", font=("Segoe UI", 8, "italic"), bg=BG_CHAT, fg=TEXT_MUTED, anchor="w", padx=15)
-        self.lbl_typing.pack(fill="x")
+        self.status_bar = tk.Frame(self.chat_pane, bg=BG_CHAT)
+        self.status_bar.pack(fill="x")
 
-        self.transfer_progress = ttk.Progressbar(self.chat_pane, orient="horizontal", mode="determinate")
+        self.lbl_typing = tk.Label(self.status_bar, text="", font=("Segoe UI", 8, "italic"), bg=BG_CHAT, fg=TEXT_MUTED, anchor="w", padx=15)
+        self.lbl_typing.pack(side="left")
+
+        self.transfer_progress = ttk.Progressbar(self.status_bar, orient="horizontal", mode="determinate")
         # Hidden initially
 
         # Input Bar
-        input_frame = tk.Frame(self.chat_pane, bg=BG_SIDEBAR, padx=10, pady=10)
+        input_frame = tk.Frame(self.chat_pane, bg=BG_SIDEBAR, padx=10, pady=8)
         input_frame.pack(fill="x")
 
-        btn_file = tk.Button(input_frame, text="📎 Send File", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 10), relief="flat", command=self._pick_and_send_file)
-        btn_file.pack(side="left", padx=(0, 8), ipady=4)
+        btn_file = tk.Button(input_frame, text="📎 File", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._pick_and_send_file)
+        btn_file.pack(side="left", padx=(0, 6), ipady=3)
+
+        self.btn_voice = tk.Button(input_frame, text="🎙️ Voice Note", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._toggle_voice_record)
+        self.btn_voice.pack(side="left", padx=(0, 6), ipady=3)
 
         self.txt_input = tk.Entry(input_frame, bg=BG_INPUT, fg=TEXT_WHITE, insertbackground=TEXT_WHITE, font=("Segoe UI", 11), relief="flat")
-        self.txt_input.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+        self.txt_input.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
         self.txt_input.bind("<Return>", lambda e: self._send_message())
         self.txt_input.bind("<Key>", self._on_typing)
         self.txt_input.focus_set()
 
         btn_send = tk.Button(input_frame, text="Send 🚀", bg=ACCENT_BLUE, fg=TEXT_WHITE, font=("Segoe UI", 10, "bold"), relief="flat", command=self._send_message)
-        btn_send.pack(side="right", ipady=4, padx=(0, 4))
+        btn_send.pack(side="right", ipady=3, padx=(0, 2))
 
     # ============================================================
-    # UI Event Handlers & Chat Logic
+    # Isolated Chat History & Rendering
     # ============================================================
 
-    def _append_log(self, text: str, tag: str = "", timestamp: str = ""):
+    def _append_to_history(self, target_channel_or_user: str, item: Dict[str, Any]):
+        """Save message/event to the specific channel or DM's history log."""
+        self.chat_histories[target_channel_or_user].append(item)
+        if self.current_target == target_channel_or_user:
+            self._render_single_item(item)
+        else:
+            self.unread_counts[target_channel_or_user] += 1
+            self._refresh_sidebar_unread()
+
+    def _render_active_chat(self):
+        """Clear and re-render only the messages belonging to the current room/DM."""
         self.msg_box.configure(state="normal")
-        ts_str = timestamp or datetime.datetime.now().strftime("%H:%M:%S")
+        self.msg_box.delete("1.0", tk.END)
+        items = self.chat_histories.get(self.current_target, [])
+        for item in items:
+            self._render_single_item(item)
+        self.msg_box.configure(state="disabled")
+        self.msg_box.see(tk.END)
+
+    def _render_single_item(self, item: Dict[str, Any]):
+        self.msg_box.configure(state="normal")
+        ts_str = item.get("time") or datetime.datetime.now().strftime("%H:%M:%S")
         self.msg_box.insert(tk.END, f"[{ts_str}] ", "time")
+        tag = item.get("tag", "")
+        text = item.get("text", "")
         self.msg_box.insert(tk.END, f"{text}\n", tag)
+
+        # Quick Switch DM button if alert in another room
+        if item.get("is_dm_switch") and item.get("switch_target"):
+            starget = item["switch_target"]
+            btn_switch = tk.Button(self.msg_box, text=f"💬 Open {starget} Chat", bg=ACCENT_MAGENTA, fg=TEXT_WHITE, font=("Segoe UI", 8, "bold"), relief="flat", padx=6, pady=2, command=lambda t=starget: self._switch_to_target(t))
+            self.msg_box.window_create(tk.END, window=btn_switch)
+            self.msg_box.insert(tk.END, "\n\n")
+
+        # Inline interactive voice player button
+        if item.get("is_voice") and item.get("voice_path"):
+            vpath = item["voice_path"]
+            btn_play = tk.Button(self.msg_box, text="▶ Play Voice Note", bg=BG_INPUT, fg="#38bdf8", font=("Segoe UI", 8, "bold"), relief="flat", padx=6, pady=2, command=lambda p=vpath: play_audio_file(p))
+            self.msg_box.window_create(tk.END, window=btn_play)
+            self.msg_box.insert(tk.END, "\n\n")
+
+        # Inline open file button
+        if item.get("is_file") and item.get("file_path"):
+            fpath = item["file_path"]
+            btn_open = tk.Button(self.msg_box, text="📂 Open File", bg=BG_INPUT, fg=ACCENT_YELLOW, font=("Segoe UI", 8), relief="flat", padx=6, pady=2, command=lambda p=fpath: self._open_file_path(p))
+            self.msg_box.window_create(tk.END, window=btn_open)
+            self.msg_box.insert(tk.END, "\n\n")
+
         self.msg_box.see(tk.END)
         self.msg_box.configure(state="disabled")
+
+    def _switch_to_target(self, target_name: str):
+        self.current_target = target_name
+        self.unread_counts[target_name] = 0
+        if target_name.startswith("@"):
+            self.lbl_target.config(text=f"Direct: {target_name}", fg=ACCENT_MAGENTA)
+            self.lbl_sec_badge.config(text="🔒 Zero-Knowledge E2EE (X25519 ECDH)", fg=ACCENT_MAGENTA)
+            self.room_listbox.selection_clear(0, tk.END)
+        else:
+            self.lbl_target.config(text=target_name, fg=ACCENT_BLUE)
+            self.lbl_sec_badge.config(text="🛡️ AES-GCM Transport Encrypted", fg=ACCENT_GREEN)
+            self.user_listbox.selection_clear(0, tk.END)
+        self._refresh_sidebar_unread()
+        self._render_active_chat()
+
+    def _open_file_path(self, filepath: str):
+        if os.path.exists(filepath):
+            if os.name == 'nt':
+                os.startfile(os.path.abspath(filepath))
+            else:
+                os.system(f"xdg-open '{os.path.abspath(filepath)}'")
+        else:
+            messagebox.showwarning("File Missing", f"File not found: {filepath}")
+
+    def _refresh_sidebar_rooms(self):
+        self.room_listbox.delete(0, tk.END)
+        for r in sorted(self.joined_rooms):
+            unread = self.unread_counts.get(r, 0)
+            badge = f" ({unread})" if unread > 0 else ""
+            self.room_listbox.insert(tk.END, f"{r}{badge}")
+
+    def _refresh_sidebar_users(self):
+        self.user_listbox.delete(0, tk.END)
+        for u in sorted(self.online_users.values(), key=lambda x: x["username"].lower()):
+            if u["username"].lower() == self.my_username.lower():
+                continue
+            name = u["username"]
+            st = u.get("status", "online")
+            dot = "🟢" if st == "online" else ("🟡" if st == "away" else "🔴")
+            target_key = f"@{name}"
+            unread = self.unread_counts.get(target_key, 0)
+            badge = f" ({unread})" if unread > 0 else ""
+            self.user_listbox.insert(tk.END, f"{dot} {name}{badge}")
+
+    def _refresh_sidebar_unread(self):
+        self._refresh_sidebar_rooms()
+        self._refresh_sidebar_users()
 
     def _on_room_select(self, event):
         sel = self.room_listbox.curselection()
         if sel:
-            room = self.room_listbox.get(sel[0])
-            self.current_target = room
-            self.lbl_target.config(text=room, fg=TEXT_WHITE)
-            self.lbl_sec_badge.config(text="🛡️ AES-GCM Transport Encrypted", fg=ACCENT_GREEN)
-            self.user_listbox.selection_clear(0, tk.END)
+            raw_text = self.room_listbox.get(sel[0])
+            room = raw_text.split(" ")[0].strip()
+            self._switch_to_target(room)
 
     def _on_user_select(self, event):
         sel = self.user_listbox.curselection()
         if sel:
             raw_text = self.user_listbox.get(sel[0])
-            user = raw_text.split(" ")[1]
-            self.current_target = f"@{user}"
-            self.lbl_target.config(text=f"Direct: @{user}", fg=ACCENT_MAGENTA)
-            self.lbl_sec_badge.config(text="🔒 Zero-Knowledge E2EE (X25519 ECDH)", fg=ACCENT_MAGENTA)
-            self.room_listbox.selection_clear(0, tk.END)
+            user = raw_text.split(" ")[1].strip()
+            self._switch_to_target(f"@{user}")
+
+    # ============================================================
+    # Voice Note Recording
+    # ============================================================
+
+    def _toggle_voice_record(self):
+        if not self.is_recording_voice:
+            vname = f"voice_sent_{self.my_username}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            self.temp_voice_file = os.path.join(VOICE_DIR, vname)
+            if start_voice_recording():
+                self.is_recording_voice = True
+                self.voice_record_start_time = time.time()
+                self.btn_voice.config(text="🔴 Stop & Send", bg=ACCENT_RED, fg=TEXT_WHITE)
+                self._update_voice_timer()
+            else:
+                messagebox.showerror("Audio Error", "Could not start microphone recording.")
+        else:
+            self.is_recording_voice = False
+            if self.voice_timer_id:
+                self.after_cancel(self.voice_timer_id)
+                self.voice_timer_id = None
+            self.btn_voice.config(text="🎙️ Voice Note", bg=BG_INPUT, fg=TEXT_WHITE)
+            self.lbl_typing.config(text="")
+            
+            ok = stop_voice_recording(self.temp_voice_file)
+            if ok and os.path.exists(self.temp_voice_file):
+                vfile = self.temp_voice_file
+                threading.Thread(target=self._send_file_worker, args=(vfile, True), daemon=True).start()
+            else:
+                messagebox.showwarning("Voice Recording", "No audio recorded.")
+
+    def _update_voice_timer(self):
+        if self.is_recording_voice:
+            sec = int(time.time() - self.voice_record_start_time)
+            self.lbl_typing.config(text=f"🔴 Recording Voice Note ({sec}s)... Click 'Stop & Send' to finish")
+            self.voice_timer_id = self.after(1000, self._update_voice_timer)
+
+    # ============================================================
+    # Messaging & File Transfer
+    # ============================================================
 
     def _prompt_join_room(self):
         top = tk.Toplevel(self)
@@ -356,18 +529,16 @@ class SecureChatGUI(tk.Tk):
             if r:
                 if not r.startswith("#"):
                     r = "#" + r
-                send_json_packet(self.sock, {"type": "ROOM_JOIN", "room": r}, self.aes_cipher)
+                self._send_packet({"type": "ROOM_JOIN", "room": r})
                 self.joined_rooms.add(r)
-                self.room_listbox.delete(0, tk.END)
-                for room in sorted(self.joined_rooms):
-                    self.room_listbox.insert(tk.END, room)
+                self._refresh_sidebar_rooms()
             top.destroy()
 
         tk.Button(top, text="Join", bg=ACCENT_BLUE, fg=TEXT_WHITE, command=submit).pack(pady=5)
 
     def _change_status(self):
         st = self.status_var.get()
-        send_json_packet(self.sock, {"type": "STATUS", "status": st}, self.aes_cipher)
+        self._send_packet({"type": "STATUS", "status": st})
 
     def _on_typing(self, event):
         if not self.is_typing:
@@ -378,7 +549,7 @@ class SecureChatGUI(tk.Tk):
                 "target": self.current_target[1:] if self.current_target.startswith("@") else None,
                 "is_typing": True
             }
-            send_json_packet(self.sock, packet, self.aes_cipher)
+            self._send_packet(packet)
 
         if self.typing_timer:
             self.after_cancel(self.typing_timer)
@@ -392,7 +563,7 @@ class SecureChatGUI(tk.Tk):
             "target": self.current_target[1:] if self.current_target.startswith("@") else None,
             "is_typing": False
         }
-        send_json_packet(self.sock, packet, self.aes_cipher)
+        self._send_packet(packet)
 
     def _open_downloads_dir(self):
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -401,22 +572,34 @@ class SecureChatGUI(tk.Tk):
         else:
             os.system(f"xdg-open '{os.path.abspath(DOWNLOADS_DIR)}'")
 
+    def _open_voice_dir(self):
+        os.makedirs(VOICE_DIR, exist_ok=True)
+        if os.name == 'nt':
+            os.startfile(os.path.abspath(VOICE_DIR))
+        else:
+            os.system(f"xdg-open '{os.path.abspath(VOICE_DIR)}'")
+
     def _get_e2ee_key(self, target_user: str) -> Optional[bytes]:
-        if target_user in self.e2ee_keys_cache:
-            return self.e2ee_keys_cache[target_user]
-        user_info = self.online_users.get(target_user)
-        if user_info and user_info.get("pubkey"):
+        if not target_user:
+            return None
+        target_clean = target_user.lstrip("@").strip()
+        if target_clean.lower() == self.my_username.lower():
             try:
-                shared = derive_e2ee_shared_key(self.my_priv_key, user_info["pubkey"])
-                self.e2ee_keys_cache[target_user] = shared
-                return shared
+                return derive_e2ee_shared_key(self.my_priv_key, self.my_pubkey_hex)
             except Exception:
                 return None
+        for name, key in self.e2ee_keys_cache.items():
+            if name.lower() == target_clean.lower():
+                return key
+        for name, user_info in self.online_users.items():
+            if name.lower() == target_clean.lower() and user_info.get("pubkey"):
+                try:
+                    shared = derive_e2ee_shared_key(self.my_priv_key, user_info["pubkey"])
+                    self.e2ee_keys_cache[name] = shared
+                    return shared
+                except Exception:
+                    return None
         return None
-
-    # ============================================================
-    # Messaging & File Transfer
-    # ============================================================
 
     def _send_message(self):
         text = self.txt_input.get().strip()
@@ -427,10 +610,10 @@ class SecureChatGUI(tk.Tk):
 
         if self.current_target.startswith("@"):
             # Direct Message (E2EE)
-            target = self.current_target[1:]
+            target = self.current_target.lstrip("@").strip()
             shared_key = self._get_e2ee_key(target)
             if not shared_key:
-                messagebox.showerror("E2EE Error", f"Cannot establish E2EE session with @{target}")
+                messagebox.showerror("E2EE Error", f"Cannot establish E2EE session with @{target}. User may be offline.")
                 return
             enc_payload = e2ee_encrypt_payload(shared_key, text)
             packet = {
@@ -438,8 +621,15 @@ class SecureChatGUI(tk.Tk):
                 "target": target,
                 "content": enc_payload
             }
-            send_json_packet(self.sock, packet, self.aes_cipher)
-            self._append_log(f"🔒 [E2EE to @{target}] {self.my_username}: {text}", "e2ee_user")
+            self._send_packet(packet)
+            
+            # Save to history & log file
+            log_chat_history_to_file(f"[E2EE DM] {self.my_username} -> @{target}: {text}")
+            self._append_to_history(self.current_target, {
+                "text": f"🔒 [E2EE to @{target}] {self.my_username}: {text}",
+                "tag": "e2ee_user",
+                "time": datetime.datetime.now().strftime("%H:%M:%S")
+            })
         else:
             # Room Message
             packet = {
@@ -447,26 +637,31 @@ class SecureChatGUI(tk.Tk):
                 "room": self.current_target,
                 "content": text
             }
-            send_json_packet(self.sock, packet, self.aes_cipher)
-            self._append_log(f"[{self.current_target}] {self.my_username}: {text}", "user")
+            self._send_packet(packet)
+            log_chat_history_to_file(f"[{self.current_target}] {self.my_username}: {text}")
+            self._append_to_history(self.current_target, {
+                "text": f"[{self.current_target}] {self.my_username}: {text}",
+                "tag": "user",
+                "time": datetime.datetime.now().strftime("%H:%M:%S")
+            })
 
     def _pick_and_send_file(self):
         filepath = filedialog.askopenfilename(title="Select File to Send")
         if not filepath:
             return
-        threading.Thread(target=self._send_file_worker, args=(filepath,), daemon=True).start()
+        threading.Thread(target=self._send_file_worker, args=(filepath, False), daemon=True).start()
 
-    def _send_file_worker(self, filepath: str):
+    def _send_file_worker(self, filepath: str, is_voice_note: bool = False):
         filename = os.path.basename(filepath)
         filehash, filesize = compute_file_sha256(filepath)
         num_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE if filesize > 0 else 1
         transfer_id = str(uuid.uuid4())[:8]
 
         is_e2ee = self.current_target.startswith("@")
-        target_user = self.current_target[1:] if is_e2ee else None
+        target_user = self.current_target.lstrip("@").strip() if is_e2ee else None
         shared_key = self._get_e2ee_key(target_user) if is_e2ee else None
 
-        self.after(0, lambda: self.transfer_progress.pack(fill="x", padx=10, pady=2))
+        self.after(0, lambda: self.transfer_progress.pack(side="right", fill="x", expand=True, padx=10))
 
         start_packet = {
             "type": "PFILE_START" if is_e2ee else "FILE_START",
@@ -477,10 +672,34 @@ class SecureChatGUI(tk.Tk):
             "num_chunks": num_chunks,
             "target": target_user,
             "room": self.current_target,
-            "is_e2ee": is_e2ee
+            "is_e2ee": is_e2ee,
+            "is_voice": is_voice_note
         }
-        send_json_packet(self.sock, start_packet, self.aes_cipher)
-        self.after(0, lambda: self._append_log(f"Uploading '{filename}' ({filesize:,} bytes)...", "file"))
+        self._send_packet(start_packet)
+
+        target_log = self.current_target
+        item_text = f"🎙️ Sent Voice Note '{filename}' ({filesize} bytes)" if is_voice_note else f"📁 Sent File '{filename}' ({filesize:,} bytes)"
+        log_chat_history_to_file(f"[File Upload] {self.my_username} -> {target_user or self.current_target}: {filename} ({filesize:,} bytes)")
+
+        self.after(0, lambda: self._append_to_history(target_log, {
+            "text": item_text,
+            "tag": "voice" if is_voice_note else "file",
+            "is_voice": is_voice_note,
+            "voice_path": filepath if is_voice_note else "",
+            "is_file": not is_voice_note,
+            "file_path": filepath if not is_voice_note else ""
+        }))
+
+        # Track in transfer log
+        self.file_transfers.append({
+            "time": datetime.datetime.now().strftime("%H:%M:%S"),
+            "filename": filename,
+            "size": f"{filesize:,} bytes",
+            "sender": self.my_username,
+            "target": target_user or self.current_target,
+            "path": filepath,
+            "status": "Uploaded"
+        })
 
         sent_bytes = 0
         with open(filepath, "rb") as f:
@@ -491,7 +710,7 @@ class SecureChatGUI(tk.Tk):
                 chunk_payload = e2ee_encrypt_bytes(shared_key, chunk) if is_e2ee and shared_key else chunk
                 chunk_b64 = base64.b64encode(chunk_payload).decode("ascii")
 
-                send_json_packet(self.sock, {
+                self._send_packet({
                     "type": "FILE_CHUNK",
                     "transfer_id": transfer_id,
                     "chunk_idx": idx,
@@ -499,21 +718,54 @@ class SecureChatGUI(tk.Tk):
                     "data": chunk_b64,
                     "target": target_user,
                     "room": self.current_target
-                }, self.aes_cipher)
+                })
 
                 sent_bytes += len(chunk)
                 pct = int((sent_bytes / max(1, filesize)) * 100)
                 self.after(0, lambda p=pct: self.transfer_progress.configure(value=p))
 
-        send_json_packet(self.sock, {
+        self._send_packet({
             "type": "FILE_END",
             "transfer_id": transfer_id,
             "target": target_user,
             "room": self.current_target
-        }, self.aes_cipher)
+        })
 
         self.after(0, lambda: self.transfer_progress.pack_forget())
-        self.after(0, lambda: self._append_log(f"✓ Upload Complete: '{filename}'", "file"))
+
+    def _show_transfer_history(self):
+        """Display transfer audit log in a modal window."""
+        top = tk.Toplevel(self)
+        top.title("File Transfer History & Audit Log")
+        top.geometry("750x400")
+        top.configure(bg=BG_SIDEBAR)
+
+        tk.Label(top, text="📋 File Transfer & Voice Note History", font=("Segoe UI", 12, "bold"), bg=BG_SIDEBAR, fg=TEXT_WHITE).pack(anchor="w", padx=15, pady=10)
+
+        cols = ("Time", "File / Voice", "Size", "From / To", "Status", "Path")
+        tree = ttk.Treeview(top, columns=cols, show="headings", height=12)
+        for c in cols:
+            tree.heading(c, text=c)
+            tree.column(c, width=110)
+        tree.column("File / Voice", width=150)
+        tree.column("Path", width=180)
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        for t in reversed(self.file_transfers):
+            tree.insert("", tk.END, values=(t["time"], t["filename"], t["size"], f"{t['sender']} -> {t['target']}", t["status"], t["path"]))
+
+        def open_selected():
+            sel = tree.selection()
+            if sel:
+                item = tree.item(sel[0])
+                path = item["values"][5]
+                self._open_file_path(path)
+
+        btn_row = tk.Frame(top, bg=BG_SIDEBAR)
+        btn_row.pack(fill="x", padx=15, pady=5)
+        tk.Button(btn_row, text="📂 Open Selected File", bg=ACCENT_BLUE, fg=TEXT_WHITE, font=("Segoe UI", 9, "bold"), relief="flat", command=open_selected).pack(side="left", padx=(0, 10))
+        tk.Button(btn_row, text="📁 Open Downloads Folder", bg=BG_INPUT, fg=TEXT_WHITE, font=("Segoe UI", 9), relief="flat", command=self._open_downloads_dir).pack(side="left", padx=(0, 10))
+        tk.Button(btn_row, text="🎙️ Open Voice Notes", bg=BG_INPUT, fg="#38bdf8", font=("Segoe UI", 9), relief="flat", command=self._open_voice_dir).pack(side="left")
 
     # ============================================================
     # Background Receiver Thread
@@ -529,11 +781,16 @@ class SecureChatGUI(tk.Tk):
             ptype = packet.get("type")
 
             if ptype == "ROOM_MSG":
-                room = packet.get("room")
+                room = packet.get("room", "#general")
                 sender = packet.get("sender")
                 content = packet.get("content")
                 ts = packet.get("timestamp")
-                self.after(0, lambda r=room, s=sender, c=content, t=ts: self._append_log(f"[{r}] {s}: {c}", "user", t))
+                log_chat_history_to_file(f"[{room}] {sender}: {content}")
+                self.after(0, lambda r=room, s=sender, c=content, t=ts: self._append_to_history(r, {
+                    "text": f"[{r}] {s}: {c}",
+                    "tag": "user",
+                    "time": t
+                }))
 
             elif ptype == "PMSG":
                 sender = packet.get("sender")
@@ -545,26 +802,49 @@ class SecureChatGUI(tk.Tk):
                     msg_text = pt or "[Decryption Error]"
                 else:
                     msg_text = "[Encrypted Message - Missing Key]"
-                self.after(0, lambda s=sender, m=msg_text, t=ts: self._append_log(f"🔒 [E2EE from @{s}] {s}: {m}", "e2ee_user", t))
+                
+                target_key = f"@{sender}"
+                log_chat_history_to_file(f"[E2EE DM] {sender} -> @{self.my_username}: {msg_text}")
+                
+                # Append to sender's DM history
+                self.after(0, lambda s=sender, m=msg_text, t=ts, tk_key=target_key: self._on_receive_dm(s, m, t, tk_key))
                 self.bell()
 
             elif ptype == "HIST":
-                room = packet.get("room")
+                room = packet.get("room", "#general")
                 sender = packet.get("sender")
                 content = packet.get("content")
                 ts = packet.get("timestamp")
-                self.after(0, lambda r=room, s=sender, c=content, t=ts: self._append_log(f"[History {t}] [{r}] {s}: {c}", "hist"))
+                self.after(0, lambda r=room, s=sender, c=content, t=ts: self._append_to_history(r, {
+                    "text": f"[History {t}] [{r}] {s}: {c}",
+                    "tag": "hist",
+                    "time": t
+                }))
 
             elif ptype == "SYS":
                 content = packet.get("content")
-                self.after(0, lambda c=content: self._append_log(f"*** {c} ***", "sys"))
+                room = packet.get("room") or self.current_target
+                log_chat_history_to_file(f"[SYS] {content}")
+                self.after(0, lambda c=content, r=room: self._append_to_history(r, {
+                    "text": f"*** {c} ***",
+                    "tag": "sys"
+                }))
 
             elif ptype == "ERR":
                 content = packet.get("content")
-                self.after(0, lambda c=content: self._append_log(f"[Error] {c}", "err"))
+                self.after(0, lambda c=content: self._append_to_history(self.current_target, {
+                    "text": f"[Error] {c}",
+                    "tag": "err"
+                }))
 
             elif ptype == "USERLIST":
                 users = packet.get("users", [])
+                for u in users:
+                    if u["username"].lower() != self.my_username.lower() and u.get("pubkey"):
+                        try:
+                            self.e2ee_keys_cache[u["username"]] = derive_e2ee_shared_key(self.my_priv_key, u["pubkey"])
+                        except Exception:
+                            pass
                 self.after(0, lambda u=users: self._update_userlist(u))
 
             elif ptype == "TYPING":
@@ -572,6 +852,9 @@ class SecureChatGUI(tk.Tk):
                 is_typing = packet.get("is_typing", False)
                 text = f"✍️ {sender} is typing..." if is_typing else ""
                 self.after(0, lambda t=text: self.lbl_typing.config(text=t))
+
+            elif ptype == "PING":
+                self._send_packet({"type": "PONG"})
 
             elif ptype in ("FILE_START", "PFILE_START"):
                 self._handle_file_start(packet)
@@ -582,15 +865,27 @@ class SecureChatGUI(tk.Tk):
             elif ptype == "FILE_END":
                 self._handle_file_end(packet)
 
+    def _on_receive_dm(self, sender: str, msg_text: str, timestamp: str, target_key: str):
+        """Handle incoming DM with immediate visibility regardless of active tab."""
+        # 1. Save in private DM history
+        self._append_to_history(target_key, {
+            "text": f"🔒 [E2EE from @{sender}] {sender}: {msg_text}",
+            "tag": "e2ee_user",
+            "time": timestamp
+        })
+        # 2. If user is currently looking at another room, also show notification banner in current chat view
+        if self.current_target != target_key:
+            self._append_to_history(self.current_target, {
+                "text": f"💬 [New Private Message from @{sender}]: {msg_text}",
+                "tag": "dm_alert",
+                "time": timestamp,
+                "is_dm_switch": True,
+                "switch_target": target_key
+            })
+
     def _update_userlist(self, raw_users):
         self.online_users = {u["username"]: u for u in raw_users}
-        self.user_listbox.delete(0, tk.END)
-        for u in raw_users:
-            if u["username"] == self.my_username:
-                continue
-            st = u.get("status", "online")
-            dot = "🟢" if st == "online" else ("🟡" if st == "away" else "🔴")
-            self.user_listbox.insert(tk.END, f"{dot} {u['username']}")
+        self._refresh_sidebar_users()
 
     def _handle_file_start(self, packet):
         tid = packet.get("transfer_id")
@@ -598,10 +893,12 @@ class SecureChatGUI(tk.Tk):
         filesize = int(packet.get("filesize", 0))
         sender = packet.get("sender", "Unknown")
         is_e2ee = bool(packet.get("is_e2ee", False))
+        is_voice = bool(packet.get("is_voice", False)) or filename.startswith("voice_")
 
         shared_key = self._get_e2ee_key(sender) if is_e2ee else None
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-        outpath = get_unique_filepath(DOWNLOADS_DIR, filename)
+        
+        target_dir = VOICE_DIR if is_voice else DOWNLOADS_DIR
+        outpath = get_unique_filepath(target_dir, filename)
         f_obj = open(outpath, "wb")
 
         import hashlib
@@ -617,11 +914,26 @@ class SecureChatGUI(tk.Tk):
                 "hasher": hasher,
                 "received": 0,
                 "is_e2ee": is_e2ee,
+                "is_voice": is_voice,
+                "sender": sender,
+                "room": packet.get("room", "#general"),
                 "shared_key": shared_key
             }
 
-        self.after(0, lambda: self._append_log(f"Receiving '{filename}' ({filesize:,} bytes) from {sender}...", "file"))
-        self.after(0, lambda: self.transfer_progress.pack(fill="x", padx=10, pady=2))
+        target_channel = f"@{sender}" if is_e2ee else packet.get("room", "#general")
+        banner = f"🎙️ Incoming Voice Note from {sender}..." if is_voice else f"Receiving '{filename}' ({filesize:,} bytes) from {sender}..."
+        self.after(0, lambda: self._append_to_history(target_channel, {
+            "text": banner,
+            "tag": "voice" if is_voice else "file"
+        }))
+        if self.current_target != target_channel:
+            self.after(0, lambda: self._append_to_history(self.current_target, {
+                "text": f"📥 [Private File Transfer starting from @{sender}]: '{filename}' ({filesize:,} bytes)",
+                "tag": "dm_alert",
+                "is_dm_switch": True,
+                "switch_target": target_channel
+            }))
+        self.after(0, lambda: self.transfer_progress.pack(side="right", fill="x", expand=True, padx=10))
 
     def _handle_file_chunk(self, packet):
         tid = packet.get("transfer_id")
@@ -632,9 +944,10 @@ class SecureChatGUI(tk.Tk):
                 return
             raw = base64.b64decode(chunk_b64.encode("ascii"))
             chunk = e2ee_decrypt_bytes(tr["shared_key"], raw) if tr["is_e2ee"] and tr["shared_key"] else raw
-            tr["f_obj"].write(chunk)
-            tr["hasher"].update(chunk)
-            tr["received"] += len(chunk)
+            if chunk:
+                tr["f_obj"].write(chunk)
+                tr["hasher"].update(chunk)
+                tr["received"] += len(chunk)
             pct = int((tr["received"] / max(1, tr["filesize"])) * 100)
             self.after(0, lambda p=pct: self.transfer_progress.configure(value=p))
 
@@ -646,9 +959,57 @@ class SecureChatGUI(tk.Tk):
                 return
             tr["f_obj"].close()
             ok = tr["hasher"].hexdigest() == tr["expected_hash"]
-            msg = f"✓ Downloaded: '{tr['filename']}' (Verified)" if ok else f"✗ File Corrupted: '{tr['filename']}'"
-            self.after(0, lambda: self._append_log(msg, "file"))
+            is_voice = tr.get("is_voice", False)
+            outpath = tr["outpath"]
+            sender = tr["sender"]
+            target_channel = f"@{sender}" if tr["is_e2ee"] else tr.get("room", "#general")
+
+            if ok:
+                msg = f"🎙️ Voice Note from @{sender} (Saved in {VOICE_DIR}/)" if is_voice else f"✓ Downloaded: '{tr['filename']}' (Saved in {DOWNLOADS_DIR}/)"
+            else:
+                msg = f"✗ File Corrupted: '{tr['filename']}'"
+
+            log_chat_history_to_file(f"[File Received] {sender} -> @{self.my_username}: {tr['filename']} ({tr['filesize']:,} bytes) [Verified]")
+
+            item = {
+                "text": msg,
+                "tag": "voice" if is_voice else "file",
+                "is_voice": is_voice,
+                "voice_path": outpath if is_voice else "",
+                "is_file": not is_voice,
+                "file_path": outpath if not is_voice else ""
+            }
+
+            self.after(0, lambda it=item, tc=target_channel: self._append_to_history(tc, it))
+
+            # Also show in active view if user was elsewhere
+            if self.current_target != target_channel:
+                alert_item = {
+                    "text": f"📥 [Private File Received from @{sender}]: '{tr['filename']}'",
+                    "tag": "dm_alert",
+                    "is_voice": is_voice,
+                    "voice_path": outpath if is_voice else "",
+                    "is_file": not is_voice,
+                    "file_path": outpath if not is_voice else "",
+                    "is_dm_switch": True,
+                    "switch_target": target_channel
+                }
+                self.after(0, lambda it=alert_item: self._append_to_history(self.current_target, it))
+
+            # Record in transfer audit
+            self.file_transfers.append({
+                "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                "filename": tr["filename"],
+                "size": f"{tr['filesize']:,} bytes",
+                "sender": sender,
+                "target": self.my_username,
+                "path": outpath,
+                "status": "Downloaded & Verified" if ok else "Corrupted"
+            })
+
             self.after(0, lambda: self.transfer_progress.pack_forget())
+            if is_voice and ok:
+                self.bell()
 
 
 if __name__ == "__main__":

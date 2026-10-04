@@ -5,13 +5,17 @@ __pycache__/
 
 # Test outputs and received files
 downloads/
+voice_notes/
+temp_voice/
 received_*
 *.tmp
+text.txt
 
 # SQLite & Logs
 *.db
 *.sqlite3
 chat_log.txt
+chat_history.txt
 
 # Virtual environments
 venv/
